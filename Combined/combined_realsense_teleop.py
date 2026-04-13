@@ -13,6 +13,11 @@ try:
 except ImportError:
     h5py = None
 
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
+
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 REALMAN_DIR = os.path.join(REPO_ROOT, "RealMan-main")
@@ -29,12 +34,91 @@ from leap_hand_utils.dynamixel_client import DynamixelClient  # noqa: E402
 import leap_hand_utils.leap_hand_utils as lhu  # noqa: E402
 
 
+class RealSenseRGBCollector:
+    def __init__(
+        self,
+        serial_number=None,
+        width=640,
+        height=480,
+        fps=30,
+        timeout_ms=2000,
+        warmup_frames=15,
+    ):
+        if rs is None:
+            raise RuntimeError(
+                "RealSense logging requested, but pyrealsense2 is not installed. "
+                "Install it with: pip install pyrealsense2"
+            )
+
+        self.serial_number = serial_number
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = int(fps)
+        self.timeout_ms = int(timeout_ms)
+        self.warmup_frames = int(warmup_frames)
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+
+        if self.serial_number:
+            self.config.enable_device(self.serial_number)
+        self.config.enable_stream(
+            rs.stream.color,
+            self.width,
+            self.height,
+            rs.format.rgb8,
+            self.fps,
+        )
+
+        self.profile = self.pipeline.start(self.config)
+        device = self.profile.get_device()
+        self.device_name = device.get_info(rs.camera_info.name)
+        self.device_serial = device.get_info(rs.camera_info.serial_number)
+
+        color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
+        intrinsics = color_profile.get_intrinsics()
+        self.width = int(intrinsics.width)
+        self.height = int(intrinsics.height)
+        self.fx = float(intrinsics.fx)
+        self.fy = float(intrinsics.fy)
+        self.ppx = float(intrinsics.ppx)
+        self.ppy = float(intrinsics.ppy)
+        self.distortion_model = str(intrinsics.model)
+        self.distortion_coeffs = np.asarray(intrinsics.coeffs, dtype=np.float64)
+
+        for _ in range(max(0, self.warmup_frames)):
+            try:
+                self.pipeline.wait_for_frames(timeout_ms=self.timeout_ms)
+            except RuntimeError:
+                break
+
+    def wait_for_frame(self):
+        frames = self.pipeline.wait_for_frames(timeout_ms=self.timeout_ms)
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            raise RuntimeError("RealSense returned no color frame")
+
+        return {
+            "frame_number": int(color_frame.get_frame_number()),
+            "timestamp_ms": float(color_frame.get_timestamp()),
+            "capture_time_s": time.time(),
+            "image_rgb": np.asanyarray(color_frame.get_data()).copy(),
+        }
+
+    def stop(self):
+        if getattr(self, "pipeline", None) is not None:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+            self.pipeline = None
+
+
 class TeleopHDF5Logger:
     """
-    Streams teleoperation samples into an HDF5 file using resizable datasets.
+    Streams teleoperation samples and synchronized RGB images into an HDF5 file.
     """
 
-    def __init__(self, output_path, args):
+    def __init__(self, output_path, args, camera):
         if h5py is None:
             raise RuntimeError(
                 "HDF5 logging requested, but h5py is not installed. "
@@ -44,6 +128,8 @@ class TeleopHDF5Logger:
         self.output_path = output_path
         self.sample_count = 0
         self.flush_every = max(1, int(args.log_flush_every))
+        self.camera_height = int(camera.height)
+        self.camera_width = int(camera.width)
         self.sample_dtype = np.dtype(
             [
                 ("monotonic_s", np.float64),
@@ -57,14 +143,21 @@ class TeleopHDF5Logger:
                 ("manus_joints", np.float64, (20,)),
                 ("leap_pose", np.float64, (16,)),
                 ("has_glove_data", np.bool_),
+                ("camera_frame_number", np.int64),
+                ("camera_timestamp_ms", np.float64),
+                ("camera_capture_time_s", np.float64),
+                ("has_camera_frame", np.bool_),
             ]
         )
 
-        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        log_dir = os.path.dirname(self.output_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         self.file = h5py.File(self.output_path, "w")
         self.file.require_group("time")
         self.file.require_group("arm")
         self.file.require_group("hand")
+        self.file.require_group("camera")
 
         self.file.attrs["created_utc"] = datetime.utcnow().isoformat() + "Z"
         self.file.attrs["robot_ip"] = args.robot_ip
@@ -76,9 +169,21 @@ class TeleopHDF5Logger:
         self.file.attrs["arm_rot_scale"] = args.arm_rot_scale
         self.file.attrs["calibration_countdown"] = args.calibration_countdown
         self.file.attrs["hand_current_limit"] = args.hand_current_limit
-        self.file.attrs["script"] = "combined_simple_teleop.py"
+        self.file.attrs["camera_serial"] = camera.device_serial
+        self.file.attrs["camera_name"] = camera.device_name
+        self.file.attrs["camera_width"] = self.camera_width
+        self.file.attrs["camera_height"] = self.camera_height
+        self.file.attrs["camera_fps"] = camera.fps
+        self.file.attrs["camera_fx"] = camera.fx
+        self.file.attrs["camera_fy"] = camera.fy
+        self.file.attrs["camera_ppx"] = camera.ppx
+        self.file.attrs["camera_ppy"] = camera.ppy
+        self.file.attrs["camera_distortion_model"] = camera.distortion_model
+        self.file.attrs["camera_distortion_coeffs"] = camera.distortion_coeffs
+        self.file.attrs["script"] = "combined_realsense_teleop.py"
         self.file.attrs["sample_layout"] = (
-            "Grouped datasets under /time, /arm, /hand and a flat table at /samples"
+            "Pose signals are grouped under /time, /arm, /hand, camera images under "
+            "/camera, and per-sample metadata at /samples"
         )
 
         self.datasets = {
@@ -93,20 +198,43 @@ class TeleopHDF5Logger:
             "hand/manus_joints": self._create_dataset("hand/manus_joints", (0, 20), (None, 20), np.float64),
             "hand/leap_pose": self._create_dataset("hand/leap_pose", (0, 16), (None, 16), np.float64),
             "hand/has_glove_data": self._create_dataset("hand/has_glove_data", (0,), (None,), np.bool_),
+            "camera/frame_number": self._create_dataset("camera/frame_number", (0,), (None,), np.int64),
+            "camera/timestamp_ms": self._create_dataset("camera/timestamp_ms", (0,), (None,), np.float64),
+            "camera/capture_time_s": self._create_dataset("camera/capture_time_s", (0,), (None,), np.float64),
+            "camera/has_frame": self._create_dataset("camera/has_frame", (0,), (None,), np.bool_),
+            "camera/rgb": self._create_dataset(
+                "camera/rgb",
+                (0, self.camera_height, self.camera_width, 3),
+                (None, self.camera_height, self.camera_width, 3),
+                np.uint8,
+                compression="gzip",
+                compression_opts=4,
+            ),
         }
-        self.samples_dataset = self._create_dataset(
-            "samples", (0,), (None,), self.sample_dtype
-        )
+        self.samples_dataset = self._create_dataset("samples", (0,), (None,), self.sample_dtype)
         self.file.flush()
 
-    def _create_dataset(self, name, shape, maxshape, dtype):
-        return self.file.create_dataset(
-            name=name,
-            shape=shape,
-            maxshape=maxshape,
-            dtype=dtype,
-            chunks=True,
-        )
+    def _create_dataset(
+        self,
+        name,
+        shape,
+        maxshape,
+        dtype,
+        compression=None,
+        compression_opts=None,
+    ):
+        kwargs = {
+            "name": name,
+            "shape": shape,
+            "maxshape": maxshape,
+            "dtype": dtype,
+            "chunks": True,
+        }
+        if compression is not None:
+            kwargs["compression"] = compression
+        if compression_opts is not None:
+            kwargs["compression_opts"] = compression_opts
+        return self.file.create_dataset(**kwargs)
 
     def append_sample(
         self,
@@ -120,8 +248,22 @@ class TeleopHDF5Logger:
         canfd_status,
         glove_message,
         leap_pose,
+        camera_frame,
     ):
         index = self.sample_count
+        has_camera_frame = camera_frame is not None
+        camera_rgb = (
+            np.asarray(camera_frame["image_rgb"], dtype=np.uint8)
+            if has_camera_frame
+            else np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
+        )
+        camera_frame_number = int(camera_frame["frame_number"]) if has_camera_frame else -1
+        camera_timestamp_ms = (
+            float(camera_frame["timestamp_ms"]) if has_camera_frame else np.nan
+        )
+        camera_capture_time_s = (
+            float(camera_frame["capture_time_s"]) if has_camera_frame else np.nan
+        )
 
         values = {
             "time/monotonic_s": float(monotonic_s),
@@ -141,6 +283,11 @@ class TeleopHDF5Logger:
                 dtype=np.float64,
             ),
             "hand/has_glove_data": bool(glove_message is not None),
+            "camera/frame_number": camera_frame_number,
+            "camera/timestamp_ms": camera_timestamp_ms,
+            "camera/capture_time_s": camera_capture_time_s,
+            "camera/has_frame": has_camera_frame,
+            "camera/rgb": camera_rgb,
         }
 
         for name, value in values.items():
@@ -169,6 +316,10 @@ class TeleopHDF5Logger:
                 dtype=np.float64,
             ),
             bool(glove_message is not None),
+            camera_frame_number,
+            camera_timestamp_ms,
+            camera_capture_time_s,
+            has_camera_frame,
         )
 
         self.sample_count += 1
@@ -284,11 +435,6 @@ class LeapHandDirectController:
         self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
 
     def convert_manus_to_leap_pose(self, hand_joints):
-        """
-        Direct-copy mapping from MANUS ergonomics data to LEAP-Hand-compatible
-        Allegro-style joint ordering. This follows the simple demo approach.
-        """
-
         if len(hand_joints) != 20:
             raise ValueError(f"Expected 20 MANUS joint values, got {len(hand_joints)}")
 
@@ -319,12 +465,13 @@ class LeapHandDirectController:
         return self.last_command
 
 
-class CombinedSimpleTeleop:
+class CombinedRealSenseTeleop:
     def __init__(self, args):
         self.args = args
         self.mapper = None
         self.hand = None
         self.glove = None
+        self.camera = None
         self.logger = None
 
     def setup(self):
@@ -343,9 +490,24 @@ class CombinedSimpleTeleop:
             endpoint=self.args.zmq_endpoint,
             hand_side=self.args.hand_side,
         )
+        self.camera = RealSenseRGBCollector(
+            serial_number=self.args.camera_serial,
+            width=self.args.camera_width,
+            height=self.args.camera_height,
+            fps=self.args.camera_fps,
+            timeout_ms=self.args.camera_timeout_ms,
+            warmup_frames=self.args.camera_warmup_frames,
+        )
+
+        if self.args.control_hz > self.args.camera_fps:
+            print(
+                f"Warning: control_hz ({self.args.control_hz:.1f}) is higher than "
+                f"camera_fps ({self.args.camera_fps}). Sample rate will be camera-limited."
+            )
+
         if self.args.log_hdf5:
             log_path = self.args.log_path or self._default_log_path()
-            self.logger = TeleopHDF5Logger(log_path, self.args)
+            self.logger = TeleopHDF5Logger(log_path, self.args, self.camera)
             print(f"HDF5 logging enabled: {log_path}")
 
         initial_pose = self.mapper.get_current_robot_pose()
@@ -366,13 +528,15 @@ class CombinedSimpleTeleop:
 
     def _default_log_path(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(REPO_ROOT, "Combined", "logs", f"teleop_{timestamp}.hdf5")
+        return os.path.join(
+            REPO_ROOT, "Combined", "logs", f"teleop_realsense_{timestamp}.hdf5"
+        )
 
     def run(self):
         self.setup()
         print(
-            f"\nCombined teleop running at {self.args.control_hz:.1f} Hz. "
-            "Press Ctrl+C to stop."
+            f"\nCombined teleop with RealSense running at up to "
+            f"{self.args.control_hz:.1f} Hz. Press Ctrl+C to stop."
         )
 
         dt = 1.0 / self.args.control_hz
@@ -380,6 +544,7 @@ class CombinedSimpleTeleop:
 
         while True:
             loop_start = time.perf_counter()
+            camera_frame = self.camera.wait_for_frame()
             wall_time_s = time.time()
 
             raw_pose = self.mapper.compute_target_pose()
@@ -408,6 +573,7 @@ class CombinedSimpleTeleop:
                         canfd_status=arm_ret,
                         glove_message=self.glove.message,
                         leap_pose=self.hand.last_command,
+                        camera_frame=camera_frame,
                     )
                 print(f"\nCANFD transmission error: {arm_ret}")
                 break
@@ -433,11 +599,18 @@ class CombinedSimpleTeleop:
                     canfd_status=arm_ret,
                     glove_message=glove_message,
                     leap_pose=leap_pose,
+                    camera_frame=camera_frame,
                 )
 
+            camera_status = (
+                f"cam:{camera_frame['frame_number']}"
+                if camera_frame is not None
+                else "cam:wait"
+            )
             if is_holding:
                 print(
-                    "\r[WARNING] Arm boundary/joint limit active. Hand still streaming.   ",
+                    "\r[WARNING] Arm boundary/joint limit active. "
+                    f"Hand still streaming. {camera_status}   ",
                     end="",
                     flush=True,
                 )
@@ -445,7 +618,7 @@ class CombinedSimpleTeleop:
                 formatted_pose = " ".join(f"{val:.4f}" for val in smooth_pose)
                 glove_state = "hand:on" if glove_message is not None else "hand:wait"
                 print(
-                    f"\rArm: {formatted_pose}   {glove_state}   ",
+                    f"\rArm: {formatted_pose}   {glove_state}   {camera_status}   ",
                     end="",
                     flush=True,
                 )
@@ -458,6 +631,8 @@ class CombinedSimpleTeleop:
     def shutdown(self):
         if self.logger is not None:
             self.logger.close()
+        if self.camera is not None:
+            self.camera.stop()
         if self.glove is not None:
             self.glove.close()
         if self.mapper is not None:
@@ -470,27 +645,33 @@ class CombinedSimpleTeleop:
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Simple combined teleop: Vive tracker arm + MANUS direct-copy LEAP Hand"
+        description="Combined teleop: Vive tracker arm + MANUS direct-copy LEAP Hand + RealSense RGB logging"
     )
     parser.add_argument("--robot-ip", default="192.168.1.18")
     parser.add_argument("--robot-port", type=int, default=8080)
     parser.add_argument("--zmq-endpoint", default="tcp://localhost:8000")
     parser.add_argument("--hand-side", choices=["left", "right"], default="right")
     parser.add_argument("--hand-port", default=None)
-    parser.add_argument("--control-hz", type=float, default=50.0)
+    parser.add_argument("--control-hz", type=float, default=30.0)
     parser.add_argument("--calibration-countdown", type=int, default=3)
     parser.add_argument("--arm-pos-scale", type=float, default=1.0)
     parser.add_argument("--arm-rot-scale", type=float, default=1.0)
     parser.add_argument("--hand-current-limit", type=int, default=350)
+    parser.add_argument("--camera-serial", default=None)
+    parser.add_argument("--camera-width", type=int, default=640)
+    parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument("--camera-timeout-ms", type=int, default=2000)
+    parser.add_argument("--camera-warmup-frames", type=int, default=15)
     parser.add_argument("--log-hdf5", action="store_true")
     parser.add_argument("--log-path", default=None)
-    parser.add_argument("--log-flush-every", type=int, default=50)
+    parser.add_argument("--log-flush-every", type=int, default=10)
     return parser
 
 
 def main():
     args = build_parser().parse_args()
-    teleop = CombinedSimpleTeleop(args)
+    teleop = CombinedRealSenseTeleop(args)
     try:
         teleop.run()
     except KeyboardInterrupt:
