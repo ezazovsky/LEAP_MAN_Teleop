@@ -24,9 +24,17 @@ for path in [REALMAN_DIR, MANUS_PY_DIR]:
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from teleoperate import ViveToRMMapper  # noqa: E402
-from leap_hand_utils.dynamixel_client import DynamixelClient  # noqa: E402
-import leap_hand_utils.leap_hand_utils as lhu  # noqa: E402
+try:
+    from teleoperate import ViveToRMMapper  # noqa: E402
+except ImportError:
+    ViveToRMMapper = None
+
+try:
+    from leap_hand_utils.dynamixel_client import DynamixelClient  # noqa: E402
+    import leap_hand_utils.leap_hand_utils as lhu  # noqa: E402
+except ImportError:
+    DynamixelClient = None
+    lhu = None
 
 
 class TeleopHDF5Logger:
@@ -45,7 +53,9 @@ class TeleopHDF5Logger:
         self.sample_count = 0
         self.flush_every = max(1, int(args.log_flush_every))
 
-        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        dir_path = os.path.dirname(self.output_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
         self.file = h5py.File(self.output_path, "w")
 
         self.file.attrs["created_utc"] = datetime.utcnow().isoformat() + "Z"
@@ -101,10 +111,18 @@ class TeleopHDF5Logger:
         values = {
             "time/monotonic_s": float(monotonic_s),
             "time/wall_time_s": float(wall_time_s),
-            "arm/raw_pose": np.asarray(raw_pose, dtype=np.float64),
-            "arm/bounded_pose": np.asarray(bounded_pose, dtype=np.float64),
-            "arm/safe_pose": np.asarray(safe_pose, dtype=np.float64),
-            "arm/smoothed_pose": np.asarray(smoothed_pose, dtype=np.float64),
+            "arm/raw_pose": np.asarray(
+                raw_pose if raw_pose is not None else [np.nan] * 6, dtype=np.float64
+            ),
+            "arm/bounded_pose": np.asarray(
+                bounded_pose if bounded_pose is not None else [np.nan] * 6, dtype=np.float64
+            ),
+            "arm/safe_pose": np.asarray(
+                safe_pose if safe_pose is not None else [np.nan] * 6, dtype=np.float64
+            ),
+            "arm/smoothed_pose": np.asarray(
+                smoothed_pose if smoothed_pose is not None else [np.nan] * 6, dtype=np.float64
+            ),
             "arm/hold_flag": bool(hold_flag),
             "arm/canfd_status": int(canfd_status),
             "hand/manus_joints": np.asarray(
@@ -190,6 +208,10 @@ class LeapHandDirectController:
     """
 
     def __init__(self, hand_port=None, current_limit=350):
+        if DynamixelClient is None or lhu is None:
+            raise RuntimeError(
+                "leap_hand_utils not installed. Cannot run live LEAP Hand control."
+            )
         self.kP = 400
         self.kI = 0
         self.kD = 300
@@ -324,6 +346,10 @@ class CombinedSimpleTeleop:
         self.interpolator = HighFrequencyInterpolator()
 
     def setup(self):
+        if ViveToRMMapper is None:
+            raise RuntimeError(
+                "teleoperate / openvr not installed. Cannot run live teleop."
+            )
         self.mapper = ViveToRMMapper(
             robot_ip=self.args.robot_ip,
             robot_port=self.args.robot_port,
@@ -487,7 +513,14 @@ def build_parser():
     parser.add_argument("--arm-pos-scale", type=float, default=1.0)
     parser.add_argument("--arm-rot-scale", type=float, default=1.0)
     parser.add_argument("--hand-current-limit", type=int, default=350)
-    parser.add_argument("--log-hdf5", action="store_true")
+    parser.add_argument(
+        "--log-hdf5", action="store_true", default=True,
+        help="Enable HDF5 logging (on by default). Pass --no-log-hdf5 to disable.",
+    )
+    parser.add_argument(
+        "--no-log-hdf5", dest="log_hdf5", action="store_false",
+        help="Disable HDF5 logging.",
+    )
     parser.add_argument("--log-path", default=None)
     parser.add_argument("--log-flush-every", type=int, default=50)
     return parser
