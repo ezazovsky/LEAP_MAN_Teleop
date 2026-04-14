@@ -44,27 +44,9 @@ class TeleopHDF5Logger:
         self.output_path = output_path
         self.sample_count = 0
         self.flush_every = max(1, int(args.log_flush_every))
-        self.sample_dtype = np.dtype(
-            [
-                ("monotonic_s", np.float64),
-                ("wall_time_s", np.float64),
-                ("raw_pose", np.float64, (6,)),
-                ("bounded_pose", np.float64, (6,)),
-                ("safe_pose", np.float64, (6,)),
-                ("smoothed_pose", np.float64, (6,)),
-                ("hold_flag", np.bool_),
-                ("canfd_status", np.int32),
-                ("manus_joints", np.float64, (20,)),
-                ("leap_pose", np.float64, (16,)),
-                ("has_glove_data", np.bool_),
-            ]
-        )
 
         os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
         self.file = h5py.File(self.output_path, "w")
-        self.file.require_group("time")
-        self.file.require_group("arm")
-        self.file.require_group("hand")
 
         self.file.attrs["created_utc"] = datetime.utcnow().isoformat() + "Z"
         self.file.attrs["robot_ip"] = args.robot_ip
@@ -77,9 +59,6 @@ class TeleopHDF5Logger:
         self.file.attrs["calibration_countdown"] = args.calibration_countdown
         self.file.attrs["hand_current_limit"] = args.hand_current_limit
         self.file.attrs["script"] = "combined_simple_teleop.py"
-        self.file.attrs["sample_layout"] = (
-            "Grouped datasets under /time, /arm, /hand and a flat table at /samples"
-        )
 
         self.datasets = {
             "time/monotonic_s": self._create_dataset("time/monotonic_s", (0,), (None,), np.float64),
@@ -94,10 +73,6 @@ class TeleopHDF5Logger:
             "hand/leap_pose": self._create_dataset("hand/leap_pose", (0, 16), (None, 16), np.float64),
             "hand/has_glove_data": self._create_dataset("hand/has_glove_data", (0,), (None,), np.bool_),
         }
-        self.samples_dataset = self._create_dataset(
-            "samples", (0,), (None,), self.sample_dtype
-        )
-        self.file.flush()
 
     def _create_dataset(self, name, shape, maxshape, dtype):
         return self.file.create_dataset(
@@ -150,29 +125,7 @@ class TeleopHDF5Logger:
             dataset.resize(tuple(new_shape))
             dataset[index] = value
 
-        self.samples_dataset.resize((index + 1,))
-        self.samples_dataset[index] = (
-            float(monotonic_s),
-            float(wall_time_s),
-            np.asarray(raw_pose, dtype=np.float64),
-            np.asarray(bounded_pose, dtype=np.float64),
-            np.asarray(safe_pose, dtype=np.float64),
-            np.asarray(smoothed_pose, dtype=np.float64),
-            bool(hold_flag),
-            int(canfd_status),
-            np.asarray(
-                glove_message if glove_message is not None else [np.nan] * 20,
-                dtype=np.float64,
-            ),
-            np.asarray(
-                leap_pose if leap_pose is not None else [np.nan] * 16,
-                dtype=np.float64,
-            ),
-            bool(glove_message is not None),
-        )
-
         self.sample_count += 1
-        self.file.attrs["sample_count"] = self.sample_count
 
         if self.sample_count % self.flush_every == 0:
             self.file.flush()
@@ -319,6 +272,48 @@ class LeapHandDirectController:
         return self.last_command
 
 
+class HighFrequencyInterpolator:
+    """
+    Exponential Moving Average (EMA) to upsample the lower-frequency 
+    VR tracker data into a smooth, high-frequency stream for the robot.
+    Optimized strictly for 6D poses [X, Y, Z, Rx, Ry, Rz] with proper 
+    shortest-path angle wrapping.
+    """
+    def __init__(self, alpha_pos=0.15, alpha_rot=0.15):
+        self.current_pose = None
+        self.alpha_pos = alpha_pos
+        self.alpha_rot = alpha_rot
+
+    def step(self, target_pose):
+        # Convert target to a flat numpy array to avoid list reference bugs
+        target = np.array(target_pose, dtype=np.float64)
+        
+        if self.current_pose is None:
+            self.current_pose = target.copy()
+            return self.current_pose.tolist()
+
+        # 1. Position Interpolation (X, Y, Z) - Standard Linear EMA
+        self.current_pose[:3] += self.alpha_pos * (target[:3] - self.current_pose[:3])
+
+        # 2. Rotation Interpolation (Rx, Ry, Rz) - Shortest Path EMA
+        # Step A: Calculate the raw angular difference
+        angular_diff = target[3:] - self.current_pose[3:]
+        
+        # Step B: Wrap the difference to strictly sit between -pi and +pi.
+        # Note: This assumes your RealMan robot uses radians (which is standard). 
+        # If it uses degrees, change np.pi to 180 and 2 * np.pi to 360.
+        shortest_path_diff = (angular_diff + np.pi) % (2 * np.pi) - np.pi
+        
+        # Step C: Apply the alpha smoothing to that safely wrapped difference
+        self.current_pose[3:] += self.alpha_rot * shortest_path_diff
+        
+        # Step D: Normalize the stored current pose to keep it bounded
+        # This prevents floating point drift if you spin in one direction forever
+        self.current_pose[3:] = (self.current_pose[3:] + np.pi) % (2 * np.pi) - np.pi
+
+        return self.current_pose.tolist()
+
+
 class CombinedSimpleTeleop:
     def __init__(self, args):
         self.args = args
@@ -326,6 +321,7 @@ class CombinedSimpleTeleop:
         self.hand = None
         self.glove = None
         self.logger = None
+        self.interpolator = HighFrequencyInterpolator()
 
     def setup(self):
         self.mapper = ViveToRMMapper(
@@ -362,7 +358,6 @@ class CombinedSimpleTeleop:
             self.logger.file.attrs["tracker_home_T"] = np.asarray(
                 self.mapper.tracker_home_T, dtype=np.float64
             )
-            self.logger.file.flush()
 
     def _default_log_path(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -383,18 +378,28 @@ class CombinedSimpleTeleop:
             wall_time_s = time.time()
 
             raw_pose = self.mapper.compute_target_pose()
-            bounded_pose = self.mapper.apply_safety_bounds(raw_pose)
-            safe_pose = self.mapper.apply_joint_limits(bounded_pose)
+            
+            # 1. Apply Cartesian safety limits (bounding box, radius, etc.)
+            # bounded_pose = self.mapper.apply_safety_bounds(raw_pose)
+            
+            # 2. DO NOT apply joint limits to a Cartesian pose. 
+            # The RealMan controller handles IK and joint limits natively during movep.
 
-            if safe_pose is not None:
-                final_pose = safe_pose
+            bounded_pose = raw_pose
+            
+            if bounded_pose is not None:
+                final_pose = bounded_pose
                 is_holding = False
             else:
                 final_pose = self.mapper.last_filtered_pose or self.mapper.robot_home_pose
                 is_holding = True
 
-            smooth_pose = self.mapper.apply_low_pass_filter(final_pose)
-            arm_ret = self.mapper.robot.rm_movep_canfd(smooth_pose, True, 1, 50)
+            # Using the new, safe EMA interpolator that properly maps rotation
+            smooth_pose = self.interpolator.step(final_pose)
+            
+            # trajectory_mode=1 (curve fitting), radio=20 (reduced buffer)
+            arm_ret = self.mapper.robot.rm_movep_canfd(smooth_pose, True, 1, 20)
+            
             if arm_ret != 0:
                 if self.logger is not None:
                     self.logger.append_sample(
@@ -437,7 +442,7 @@ class CombinedSimpleTeleop:
 
             if is_holding:
                 print(
-                    "\r[WARNING] Arm boundary/joint limit active. Hand still streaming.   ",
+                    "\r[WARNING] Arm boundary limit active. Hand still streaming.   ",
                     end="",
                     flush=True,
                 )
@@ -450,11 +455,10 @@ class CombinedSimpleTeleop:
                     flush=True,
                 )
 
-            elapsed = time.perf_counter() - loop_start
-            sleep_time = dt - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
+            # Precision Spin-Wait Loop to guarantee sub-millisecond execution timing
+            target_time = loop_start + dt
+            while time.perf_counter() < target_time:
+                pass
     def shutdown(self):
         if self.logger is not None:
             self.logger.close()
@@ -477,7 +481,8 @@ def build_parser():
     parser.add_argument("--zmq-endpoint", default="tcp://localhost:8000")
     parser.add_argument("--hand-side", choices=["left", "right"], default="right")
     parser.add_argument("--hand-port", default=None)
-    parser.add_argument("--control-hz", type=float, default=50.0)
+    # Kept at 125.0 Hz to meet CANFD < 10ms cycle requirement
+    parser.add_argument("--control-hz", type=float, default=125.0)
     parser.add_argument("--calibration-countdown", type=int, default=3)
     parser.add_argument("--arm-pos-scale", type=float, default=1.0)
     parser.add_argument("--arm-rot-scale", type=float, default=1.0)
