@@ -7,7 +7,6 @@ import time
 
 import numpy as np
 import zmq
-from scipy.spatial.transform import Rotation as R
 
 try:
     import h5py
@@ -69,7 +68,7 @@ class TeleopHDF5Logger:
         self.file.attrs["arm_rot_scale"] = args.arm_rot_scale
         self.file.attrs["calibration_countdown"] = args.calibration_countdown
         self.file.attrs["hand_current_limit"] = args.hand_current_limit
-        self.file.attrs["script"] = "combined_simple_teleop_real_logger.py"
+        self.file.attrs["script"] = "combined_simple_teleop.py"
 
         self.datasets = {
             "time/monotonic_s": self._create_dataset("time/monotonic_s", (0,), (None,), np.float64),
@@ -346,32 +345,6 @@ class CombinedSimpleTeleop:
         self.logger = None
         self.interpolator = HighFrequencyInterpolator()
 
-    @staticmethod
-    def _pose_snapshot(pose):
-        if pose is None:
-            return None
-        return np.asarray(pose, dtype=np.float64).copy().tolist()
-
-    def _compute_raw_pose(self):
-        current_T = self.mapper.get_current_tracker_matrix()
-        T_delta = np.linalg.inv(self.mapper.tracker_home_T) @ current_T
-        pos_delta = T_delta[:3, 3]
-
-        remapped_pos = np.array(
-            [-pos_delta[1], -pos_delta[0], -pos_delta[2]], dtype=np.float64
-        ) * self.mapper.pos_scale
-
-        rotvec_delta = R.from_matrix(T_delta[:3, :3]).as_rotvec()
-        remapped_rotvec = np.array(
-            [-rotvec_delta[1], -rotvec_delta[0], -rotvec_delta[2]], dtype=np.float64
-        ) * self.mapper.rot_scale
-        euler_delta = R.from_rotvec(remapped_rotvec).as_euler("xyz", degrees=False)
-
-        target_pose = np.asarray(self.mapper.robot_home_pose, dtype=np.float64).copy()
-        target_pose[:3] += remapped_pos
-        target_pose[3:] += euler_delta
-        return target_pose.tolist()
-
     def setup(self):
         if ViveToRMMapper is None:
             raise RuntimeError(
@@ -430,41 +403,38 @@ class CombinedSimpleTeleop:
             loop_start = time.perf_counter()
             wall_time_s = time.time()
 
-            raw_pose = None
-            bounded_pose = None
-            try:
-                raw_pose = self._compute_raw_pose()
-                # teleoperate.py is used here as a safety utility only.
-                bounded_pose = self.mapper.apply_safety_bounds(raw_pose)
-            except Exception as exc:
-                print(f"\n[WARNING] Falling back to hold pose: {exc}")
+            raw_pose = self.mapper.compute_target_pose()
+            
+            # 1. Apply Cartesian safety limits (bounding box, radius, etc.)
+            bounded_pose = self.mapper.apply_safety_bounds(raw_pose)
+            
+            # 2. DO NOT apply joint limits to a Cartesian pose. 
+            # The RealMan controller handles IK and joint limits natively during movep.
 
+            # bounded_pose = raw_pose
+            
             if bounded_pose is not None:
-                safe_pose = bounded_pose
+                final_pose = bounded_pose
                 is_holding = False
             else:
-                safe_pose = self.mapper.last_filtered_pose or self.mapper.robot_home_pose
+                final_pose = self.mapper.last_filtered_pose or self.mapper.robot_home_pose
                 is_holding = True
 
-            smoothed_pose = self.interpolator.step(safe_pose)
-
-            raw_pose_log = self._pose_snapshot(raw_pose)
-            bounded_pose_log = self._pose_snapshot(bounded_pose)
-            safe_pose_log = self._pose_snapshot(safe_pose)
-            smoothed_pose_log = self._pose_snapshot(smoothed_pose)
-
+            # Using the new, safe EMA interpolator that properly maps rotation
+            smooth_pose = self.interpolator.step(final_pose)
+            
             # trajectory_mode=1 (curve fitting), radio=20 (reduced buffer)
-            arm_ret = self.mapper.robot.rm_movep_canfd(smoothed_pose_log, True, 1, 20)
+            arm_ret = self.mapper.robot.rm_movep_canfd(smooth_pose, True, 1, 20)
             
             if arm_ret != 0:
                 if self.logger is not None:
                     self.logger.append_sample(
                         monotonic_s=loop_start,
                         wall_time_s=wall_time_s,
-                        raw_pose=raw_pose_log,
-                        bounded_pose=bounded_pose_log,
-                        safe_pose=safe_pose_log,
-                        smoothed_pose=smoothed_pose_log,
+                        raw_pose=raw_pose,
+                        bounded_pose=bounded_pose,
+                        safe_pose=final_pose,
+                        smoothed_pose=smooth_pose,
                         hold_flag=is_holding,
                         canfd_status=arm_ret,
                         glove_message=self.glove.message,
@@ -486,10 +456,10 @@ class CombinedSimpleTeleop:
                 self.logger.append_sample(
                     monotonic_s=loop_start,
                     wall_time_s=wall_time_s,
-                    raw_pose=raw_pose_log,
-                    bounded_pose=bounded_pose_log,
-                    safe_pose=safe_pose_log,
-                    smoothed_pose=smoothed_pose_log,
+                    raw_pose=raw_pose,
+                    bounded_pose=bounded_pose,
+                    safe_pose=final_pose,
+                    smoothed_pose=smooth_pose,
                     hold_flag=is_holding,
                     canfd_status=arm_ret,
                     glove_message=glove_message,
@@ -503,7 +473,7 @@ class CombinedSimpleTeleop:
                     flush=True,
                 )
             else:
-                formatted_pose = " ".join(f"{val:.4f}" for val in smoothed_pose_log)
+                formatted_pose = " ".join(f"{val:.4f}" for val in smooth_pose)
                 glove_state = "hand:on" if glove_message is not None else "hand:wait"
                 print(
                     f"\rArm: {formatted_pose}   {glove_state}   ",
