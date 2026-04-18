@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 import zmq
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as R, Slerp
 
 try:
     import h5py
@@ -318,21 +318,19 @@ class HighFrequencyInterpolator:
         # 1. Position Interpolation (X, Y, Z) - Standard Linear EMA
         self.current_pose[:3] += self.alpha_pos * (target[:3] - self.current_pose[:3])
 
-        # 2. Rotation Interpolation (Rx, Ry, Rz) - Shortest Path EMA
-        # Step A: Calculate the raw angular difference
-        angular_diff = target[3:] - self.current_pose[3:]
-        
-        # Step B: Wrap the difference to strictly sit between -pi and +pi.
-        # Note: This assumes your RealMan robot uses radians (which is standard). 
-        # If it uses degrees, change np.pi to 180 and 2 * np.pi to 360.
-        shortest_path_diff = (angular_diff + np.pi) % (2 * np.pi) - np.pi
-        
-        # Step C: Apply the alpha smoothing to that safely wrapped difference
-        self.current_pose[3:] += self.alpha_rot * shortest_path_diff
-        
-        # Step D: Normalize the stored current pose to keep it bounded
-        # This prevents floating point drift if you spin in one direction forever
-        self.current_pose[3:] = (self.current_pose[3:] + np.pi) % (2 * np.pi) - np.pi
+        # 2. Rotation Interpolation (Rx, Ry, Rz) - Quaternion SLERP
+        # Clamp interpolation time so Slerp is always evaluated on [0, 1].
+        t = float(np.clip(self.alpha_rot, 0.0, 1.0))
+        if t <= 0.0:
+            return self.current_pose.tolist()
+        if t >= 1.0:
+            self.current_pose[3:] = target[3:]
+            return self.current_pose.tolist()
+
+        rot_curr = R.from_euler("xyz", self.current_pose[3:], degrees=False)
+        rot_targ = R.from_euler("xyz", target[3:], degrees=False)
+        slerp = Slerp([0.0, 1.0], R.from_quat([rot_curr.as_quat(), rot_targ.as_quat()]))
+        self.current_pose[3:] = slerp(t).as_euler("xyz", degrees=False)
 
         return self.current_pose.tolist()
 

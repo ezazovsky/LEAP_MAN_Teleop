@@ -365,10 +365,30 @@ class ViveToRMMapper:
                 safe_pose[idx] = self._wrap_angle(last + ((1.0 - damp) * diff))
 
         # STEP 6: Log when clamping actually fires so you can verify bounds are working.
-        clamped = any(abs(safe_pose[i] - original_pose[i]) > 1e-6 for i in range(6))
+        tol = 1e-6
+        clamped = any(abs(safe_pose[i] - original_pose[i]) > tol for i in range(6))
         if clamped:
+            pos_changed = any(abs(safe_pose[i] - original_pose[i]) > tol for i in range(3))
+            rot_changed = any(abs(safe_pose[i] - original_pose[i]) > tol for i in range(3, 6))
+            rot_wrap_only = rot_changed and all(
+                abs(self._shortest_angle_diff(safe_pose[i], original_pose[i])) <= tol
+                for i in range(3, 6)
+            )
+
+            if rot_wrap_only and not pos_changed:
+                clamp_kind = "ANGLE_WRAP_ONLY"
+            else:
+                reasons = []
+                if pos_changed:
+                    reasons.append("CARTESIAN")
+                if rot_changed and not rot_wrap_only:
+                    reasons.append("ROTATION")
+                if not reasons:
+                    reasons.append("MIXED")
+                clamp_kind = "+".join(reasons)
+
             print(
-                f"[BOUNDS CLAMPED] "
+                f"[BOUNDS CLAMPED:{clamp_kind}] "
                 f"in=({original_pose[0]:.3f}, {original_pose[1]:.3f}, {original_pose[2]:.3f}, "
                 f"{original_pose[3]:.3f}, {original_pose[4]:.3f}, {original_pose[5]:.3f}) "
                 f"out=({safe_pose[0]:.3f}, {safe_pose[1]:.3f}, {safe_pose[2]:.3f}, "
