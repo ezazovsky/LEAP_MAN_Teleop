@@ -8,12 +8,20 @@ commands to the real hardware.
 Arm pose format  : [x, y, z, rx, ry, rz]  (meters, radians Euler XYZ)
 Hand pose format : [j0 .. j15]             (LEAP Hand joint angles, radians)
 
+Trajectory smoothing modes (via trajectory_mode parameter):
+  - trajectory_mode=0: passthrough (no smoothing, jittery)
+  - trajectory_mode=1: curve fitting (moderate smoothing, responsive — good for live teleop)
+  - trajectory_mode=2: filter mode (maximum smoothing, best for replay of prerecorded data)
+
 Usage as a module
 -----------------
     from robot_pose_controller import RobotPoseController
 
     ctrl = RobotPoseController(robot_ip="192.168.1.18", robot_port=8080)
-    ret  = ctrl.send_combined(arm_pose_6d, hand_pose_16d)
+    # Send with default responsive curve-fitting
+    ret  = ctrl.send_arm_pose(arm_pose_6d)
+    # Or for smooth replay, use filter mode with high smoothing
+    ret  = ctrl.send_arm_pose(arm_pose_6d, trajectory_mode=2, trajectory_radio=500)
     ctrl.shutdown()
 
 Usage from the command line (single pose test)
@@ -356,7 +364,7 @@ class RobotPoseController:
     # Public API
     # ------------------------------------------------------------------
 
-    def send_arm_pose(self, pose_6d):
+    def send_arm_pose(self, pose_6d, trajectory_mode=1, trajectory_radio=20):
         """
         Apply safety bounds and send a 6D Cartesian pose to the arm.
 
@@ -364,6 +372,15 @@ class RobotPoseController:
         ----------
         pose_6d : array-like, length 6
             [x, y, z, rx, ry, rz] in meters / radians.
+        trajectory_mode : int, default 1
+            0 = passthrough (no smoothing, jittery)
+            1 = curve fitting (moderate smoothing, responsive)
+            2 = filter mode (maximum smoothing, best for prerecorded replay)
+        trajectory_radio : int, default 20
+            Smoothing coefficient.
+            - In mode 1 (curve fitting): 0-100 (higher = smoother)
+            - In mode 2 (filter): 0-999 (higher = smoother)
+            For replay: mode 2 with radio=500-800 recommended.
 
         Returns
         -------
@@ -372,7 +389,7 @@ class RobotPoseController:
         """
         pose_list = list(np.asarray(pose_6d, dtype=np.float64))
         safe = self.safety.apply(pose_list)
-        return self.robot.rm_movep_canfd(safe, True, 1, 20)
+        return self.robot.rm_movep_canfd(safe, True, trajectory_mode, trajectory_radio)
 
     def send_hand_pose(self, leap_joints_16d):
         """
@@ -390,16 +407,27 @@ class RobotPoseController:
         clipped = lhu.angle_safety_clip(joints)
         self.hand.write_desired_pos(self._hand_motors, clipped)
 
-    def send_combined(self, arm_pose_6d, hand_pose_16d):
+    def send_combined(self, arm_pose_6d, hand_pose_16d, trajectory_mode=1, trajectory_radio=20):
         """
         Send arm and hand commands in one call.
+
+        Parameters
+        ----------
+        arm_pose_6d : array-like
+            6D Cartesian pose [x, y, z, rx, ry, rz]
+        hand_pose_16d : array-like or None
+            16D LEAP hand joint angles
+        trajectory_mode : int
+            See send_arm_pose for details
+        trajectory_radio : int
+            See send_arm_pose for details
 
         Returns
         -------
         int
             Arm CANFD status code (0 = success).
         """
-        ret = self.send_arm_pose(arm_pose_6d)
+        ret = self.send_arm_pose(arm_pose_6d, trajectory_mode, trajectory_radio)
         if hand_pose_16d is not None:
             self.send_hand_pose(hand_pose_16d)
         return ret

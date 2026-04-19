@@ -299,8 +299,8 @@ class HighFrequencyInterpolator:
     """
     Exponential Moving Average (EMA) to upsample the lower-frequency 
     VR tracker data into a smooth, high-frequency stream for the robot.
-    Optimized strictly for 6D poses [X, Y, Z, Rx, Ry, Rz] with proper 
-    shortest-path angle wrapping.
+    Optimized strictly for 6D poses [X, Y, Z, Rx, Ry, Rz] with position EMA
+    and quaternion SLERP for rotation.
     """
     def __init__(self, alpha_pos=0.15, alpha_rot=0.15):
         self.current_pose = None
@@ -310,7 +310,7 @@ class HighFrequencyInterpolator:
     def step(self, target_pose):
         # Convert target to a flat numpy array to avoid list reference bugs
         target = np.array(target_pose, dtype=np.float64)
-        
+
         if self.current_pose is None:
             self.current_pose = target.copy()
             return self.current_pose.tolist()
@@ -319,7 +319,6 @@ class HighFrequencyInterpolator:
         self.current_pose[:3] += self.alpha_pos * (target[:3] - self.current_pose[:3])
 
         # 2. Rotation Interpolation (Rx, Ry, Rz) - Quaternion SLERP
-        # Clamp interpolation time so Slerp is always evaluated on [0, 1].
         t = float(np.clip(self.alpha_rot, 0.0, 1.0))
         if t <= 0.0:
             return self.current_pose.tolist()
