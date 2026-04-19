@@ -1,0 +1,218 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║               BIMANUAL TELEOPERATION DOCUMENTATION INDEX                   ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+📖 START HERE
+─────────────
+README.md
+  • Quick start commands
+  • System overview & workflow
+  • Hardware requirements
+  • Troubleshooting quick reference
+
+
+📋 COMPREHENSIVE GUIDES
+───────────────────────
+
+1. SETUP_AND_EXECUTION.md (320 lines)
+   ├─ Physical hardware setup checklist
+   ├─ Software installation & verification
+   ├─ Pre-execution checklist
+   ├─ Live teleoperation (with 20+ command options)
+   ├─ Understanding console output
+   ├─ Replaying recordings (with 10+ command options)
+   ├─ Sending single poses
+   ├─ HDF5 inspection methods
+   ├─ Complete troubleshooting guide
+   ├─ Tips & best practices
+   └─ Quick start flowchart
+
+2. DATA_PIPELINE.md (400+ lines)
+   ├─ Complete data flow walkthrough
+   ├─ Stage 1A-1C: Data acquisition
+   │  ├─ Vive tracker input
+   │  ├─ MANUS glove input
+   │  └─ Data format details
+   ├─ Stage 2: Safety filter (6 steps explained)
+   │  ├─ Jump protection equations
+   │  ├─ Slew limiting math
+   │  ├─ Box clamp logic
+   │  ├─ Reach radius logic
+   │  └─ Boundary damping
+   ├─ Stage 3: Pose selection logic
+   ├─ Stage 4: Smoothing (EMA + SLERP)
+   ├─ Stage 4-H: Hand conversion & clipping
+   ├─ Stage 6: Hardware commands
+   ├─ Stage 7: HDF5 logging schema
+   ├─ Pipeline 2: Replay details
+   │  ├─ File loading
+   │  ├─ Robot connection
+   │  ├─ Safety filter re-seeding
+   │  ├─ Homing phase
+   │  ├─ Replay loop with timing
+   │  └─ Hardware commands
+   ├─ Data flow diagrams
+   ├─ Reference tables (shapes, types, ranges)
+   └─ Complete processing summary
+
+
+🏃 THREE WAYS TO GET STARTED
+──────────────────────────────
+
+Scenario 1: "I just want to record"
+  → Read: README.md (Quick Start section)
+  → Run: python combined_simple_teleop_real_logger.py
+  → File: logs/teleop_YYYYMMDD_HHMMSS.hdf5
+
+Scenario 2: "I need to set up the system"
+  → Read: SETUP_AND_EXECUTION.md (all sections)
+  → Follow: Pre-Execution Checklist
+  → Run: Test commands in Troubleshooting section
+
+Scenario 3: "I'm giving a research presentation"
+  → Read: DATA_PIPELINE.md (all sections)
+  → Reference: Diagrams, equations, and reference tables
+  → Explain: How data flows from sensors → recording → replay
+
+
+📁 FILE REFERENCE
+─────────────────
+
+combined_simple_teleop_real_logger.py (410 lines)
+  Main script: live teleoperation + HDF5 logging
+  Usage: python combined_simple_teleop_real_logger.py [options]
+  Default: records with HDF5 logging enabled
+
+robot_pose_controller.py (420 lines)
+  Controller class: send any 6D pose + hand commands  
+  Usage: python robot_pose_controller.py --pose X Y Z Rx Ry Rz
+  Also imported by replay_hdf5.py
+
+replay_hdf5.py (370 lines)
+  Replay recorded trajectories from HDF5
+  Usage: python replay_hdf5.py file.hdf5 [options]
+  Features: homing phase, smooth motion, timing preservation
+
+logs/
+  Directory: HDF5 recordings (auto-created)
+  Format: teleop_YYYYMMDD_HHMMSS.hdf5
+  Size: ~5-10 MB per minute of recording
+
+
+🔍 KEY SECTIONS FOR PRESENTATIONS
+──────────────────────────────────
+
+For "System Architecture":
+  → DATA_PIPELINE.md: "Data Flow Diagram" section
+  → Shows: sensors → processing → hardware
+
+For "Safety Guarantees":
+  → DATA_PIPELINE.md: "Stage 2: Safety Bounds Filtering"
+  → Shows: all 6 safety steps with equations
+
+For "Data Collection":
+  → DATA_PIPELINE.md: "Stage 7: HDF5 Logging"
+  → Shows: complete schema, metadata, logging design
+
+For "Replay Mechanism":
+  → DATA_PIPELINE.md: "Pipeline 2: Replay from HDF5"
+  → Shows: homing → replay loop → hardware
+
+For "Experimental Results":
+  → SETUP_AND_EXECUTION.md: "Understanding Live Teleoperation Output"
+  → Shows: how to interpret console output and HDF5 data
+
+
+💾 REFERENCE TABLES (in DATA_PIPELINE.md)
+──────────────────────────────────────────
+
+Table: "Key Data Types & Shapes Reference"
+  All variables with shape, type, range, units
+
+Table: Safety bounds
+  X, Y, Z ranges, reach radius, rotation limits
+
+Table: LEAP Hand joint limits
+  Min/max angles in radians (16 joints)
+
+Table: Replay command options
+  All flags with defaults and descriptions
+
+
+🚀 COMMAND QUICK REFERENCE
+───────────────────────────
+
+Record:
+  python combined_simple_teleop_real_logger.py
+
+Replay (real-time):
+  python replay_hdf5.py logs/teleop_*.hdf5
+
+Replay (half speed):
+  python replay_hdf5.py logs/teleop_*.hdf5 --speed 0.5
+
+Inspect file:
+  python replay_hdf5.py logs/teleop_*.hdf5 --dry-run
+
+Send single pose:
+  python robot_pose_controller.py --pose 0.3 0.0 0.2 0.0 0.0 0.0
+
+Full help:
+  python combined_simple_teleop_real_logger.py --help
+  python replay_hdf5.py --help
+  python robot_pose_controller.py --help
+
+
+📊 FOR RESEARCHERS
+───────────────────
+
+To understand the exact data flow:
+  1. Read DATA_PIPELINE.md systematically from top to bottom
+  2. Look at code locations cited for each stage
+  3. Refer to reference tables for data formats
+  4. Use diagrams to explain to others
+
+To reproduce results:
+  1. Check SETUP_AND_EXECUTION.md for all setup details
+  2. Follow "Pre-Execution Checklist" exactly
+  3. Use HDF5 inspection to verify data quality
+  4. Reference troubleshooting section for issues
+
+To compare with other systems:
+  Data_PIPELINE.md shows exact processing stages, so you can:
+  - Identify which stages are novel to this system
+  - Compare safety approaches
+  - Evaluate logging completeness
+  - Validate replay fidelity
+
+
+✅ VERIFICATION
+────────────────
+
+Files present:
+  ✓ README.md
+  ✓ SETUP_AND_EXECUTION.md
+  ✓ DATA_PIPELINE.md
+  ✓ combined_simple_teleop_real_logger.py
+  ✓ robot_pose_controller.py
+  ✓ replay_hdf5.py
+  ✓ logs/ (directory)
+
+Directory is clean:
+  ✓ No development/test files
+  ✓ No redundant scripts
+  ✓ Only essential code
+
+Documentation is complete:
+  ✓ Quick start guide
+  ✓ Detailed setup instructions
+  ✓ Comprehensive data pipeline explanation
+  ✓ Full command reference
+  ✓ Troubleshooting guide
+  ✓ Best practices
+
+
+════════════════════════════════════════════════════════════════════════════
+Last updated: 2026-04-19
+For questions, refer to the detailed documentation files above.
+════════════════════════════════════════════════════════════════════════════
