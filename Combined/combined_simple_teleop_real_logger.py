@@ -344,6 +344,58 @@ class CombinedSimpleTeleop:
         self.glove = None
         self.logger = None
         self.interpolator = HighFrequencyInterpolator()
+        self._last_cmd_pose = None
+        self._last_recovery_t = 0.0
+
+    @staticmethod
+    def _wrap_angle(angle):
+        return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+    @classmethod
+    def _shortest_angle_diff(cls, target, current):
+        return cls._wrap_angle(target - current)
+
+    def _stabilize_command_pose(self, pose_6d):
+        """
+        Keep rotational commands continuous across +/-pi and limit per-cycle
+        angular step to avoid triggering onboard stop/freeze behavior.
+        """
+        cmd = np.asarray(pose_6d, dtype=np.float64).copy()
+        if self._last_cmd_pose is None:
+            self._last_cmd_pose = cmd.tolist()
+            return cmd.tolist()
+
+        last_cmd = np.asarray(self._last_cmd_pose, dtype=np.float64)
+        max_rot_step = np.deg2rad(7.5)
+
+        for idx in range(3, 6):
+            last_wrapped = self._wrap_angle(last_cmd[idx])
+            diff = self._shortest_angle_diff(cmd[idx], last_wrapped)
+            diff = float(np.clip(diff, -max_rot_step, max_rot_step))
+            cmd[idx] = last_cmd[idx] + diff
+
+        self._last_cmd_pose = cmd.tolist()
+        return cmd.tolist()
+
+    def _recover_arm_stream_state(self):
+        """Recover command stream state from current robot pose without stopping teleop."""
+        now = time.perf_counter()
+        if now - self._last_recovery_t < 0.5:
+            return
+        self._last_recovery_t = now
+
+        try:
+            self.mapper.robot.rm_set_arm_run_mode(1)
+        except Exception:
+            pass
+
+        current_pose = self.mapper.get_current_robot_pose()
+        if current_pose is None:
+            return
+
+        self.mapper.last_filtered_pose = list(current_pose)
+        self.interpolator.current_pose = np.asarray(current_pose, dtype=np.float64)
+        self._last_cmd_pose = list(current_pose)
 
     @staticmethod
     def _pose_snapshot(pose):
@@ -443,6 +495,7 @@ class CombinedSimpleTeleop:
             time.sleep(1)
 
         self.mapper.calibrate(countdown=self.args.calibration_countdown)
+        self._last_cmd_pose = list(self.mapper.robot_home_pose)
 
         if self.logger is not None:
             self.logger.file.attrs["tracker_key"] = getattr(self.mapper, "tracker_key", "")
@@ -466,6 +519,7 @@ class CombinedSimpleTeleop:
 
         dt = 1.0 / self.args.control_hz
         warned_no_glove = False
+        canfd_error_streak = 0
 
         while True:
             loop_start = time.perf_counter()
@@ -488,6 +542,7 @@ class CombinedSimpleTeleop:
                 is_holding = True
 
             smoothed_pose = self.interpolator.step(safe_pose)
+            smoothed_pose = self._stabilize_command_pose(smoothed_pose)
 
             raw_pose_log = self._pose_snapshot(raw_pose)
             bounded_pose_log = self._pose_snapshot(bounded_pose)
@@ -496,23 +551,26 @@ class CombinedSimpleTeleop:
 
             # trajectory_mode=1 (curve fitting), radio=20 (reduced buffer)
             arm_ret = self.mapper.robot.rm_movep_canfd(smoothed_pose_log, True, 1, 20)
-            
-            if arm_ret != 0:
-                if self.logger is not None:
-                    self.logger.append_sample(
-                        monotonic_s=loop_start,
-                        wall_time_s=wall_time_s,
-                        raw_pose=raw_pose_log,
-                        bounded_pose=bounded_pose_log,
-                        safe_pose=safe_pose_log,
-                        smoothed_pose=smoothed_pose_log,
-                        hold_flag=is_holding,
-                        canfd_status=arm_ret,
-                        glove_message=self.glove.message,
-                        leap_pose=self.hand.last_command,
+            arm_ok = (arm_ret == 0)
+            if arm_ok:
+                canfd_error_streak = 0
+            else:
+                canfd_error_streak += 1
+                # Do not hard-stop teleop on transient onboard safety events.
+                if canfd_error_streak == 1 or (canfd_error_streak % 20 == 0):
+                    print(
+                        f"\n[WARNING] CANFD transmission error: {arm_ret} "
+                        f"(streak={canfd_error_streak})"
                     )
-                print(f"\nCANFD transmission error: {arm_ret}")
-                break
+                # Periodically re-assert teleop run mode to recover from temporary arm state changes.
+                if canfd_error_streak % 10 == 0:
+                    try:
+                        self.mapper.robot.rm_set_arm_run_mode(1)
+                    except Exception:
+                        pass
+                # Hard recovery when error streak persists: re-seed command state from live arm pose.
+                if canfd_error_streak % 25 == 0:
+                    self._recover_arm_stream_state()
 
             glove_message = self.glove.message
             leap_pose = self.hand.last_command
@@ -537,7 +595,13 @@ class CombinedSimpleTeleop:
                     leap_pose=leap_pose,
                 )
 
-            if is_holding:
+            if not arm_ok:
+                print(
+                    "\r[WARNING] Arm command retrying after CANFD error. Hand still streaming.   ",
+                    end="",
+                    flush=True,
+                )
+            elif is_holding:
                 print(
                     "\r[WARNING] Arm boundary limit active. Hand still streaming.   ",
                     end="",
