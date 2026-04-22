@@ -335,6 +335,8 @@ class HighFrequencyInterpolator:
 
 
 class CombinedSimpleTeleop:
+    START_JOINT_DEG = [0.0, 25.0, 90.0, 0.0, 60.0, 0.0]
+
     def __init__(self, args):
         self.args = args
         self.mapper = None
@@ -369,6 +371,45 @@ class CombinedSimpleTeleop:
         target_pose[3:] += euler_delta
         return target_pose.tolist()
 
+    def _move_robot_to_start_joints(self):
+        """Move to a fixed, known-safe start joint pose before teleop calibration."""
+        target_joints = list(self.START_JOINT_DEG)
+        robot = self.mapper.robot
+
+        print(
+            "\nMoving arm to start joints (deg): "
+            + " ".join(f"{v:.1f}" for v in target_joints)
+        )
+
+        move_attempts = [
+            ("rm_movej", (target_joints, 20, 0, 0, 1)),
+            ("rm_movej", (target_joints, 20, 0, 1)),
+            ("rm_movej", (target_joints, 20, 0, 0)),
+            ("rm_movej", (target_joints, 20, 0)),
+            ("rm_movej_p", (target_joints, 20, 0, 0, 1)),
+            ("rm_movej_p", (target_joints, 20, 0, 1)),
+        ]
+
+        last_exc = None
+        for method_name, args in move_attempts:
+            method = getattr(robot, method_name, None)
+            if method is None:
+                continue
+            try:
+                ret = method(*args)
+                if ret == 0:
+                    time.sleep(0.5)
+                    return
+                last_exc = RuntimeError(f"{method_name} returned {ret}")
+            except TypeError:
+                continue
+            except Exception as exc:
+                last_exc = exc
+
+        raise RuntimeError(
+            f"Failed to move to start joints {target_joints}. Last error: {last_exc}"
+        )
+
     def setup(self):
         if ViveToRMMapper is None:
             raise RuntimeError(
@@ -380,6 +421,9 @@ class CombinedSimpleTeleop:
         )
         self.mapper.pos_scale = self.args.arm_pos_scale
         self.mapper.rot_scale = self.args.arm_rot_scale
+
+        # Force a deterministic start posture before calibration/teleop.
+        self._move_robot_to_start_joints()
 
         self.hand = LeapHandDirectController(
             hand_port=self.args.hand_port,
