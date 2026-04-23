@@ -6,16 +6,34 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-REALMAN_DIR = os.path.join(REPO_ROOT, "RealMan-main")
-if REALMAN_DIR not in sys.path:
-    sys.path.insert(0, REALMAN_DIR)
+RMAPI_PY_DIR = os.path.join(REPO_ROOT, "RMAPI", "Python")
+if RMAPI_PY_DIR not in sys.path:
+    sys.path.insert(0, RMAPI_PY_DIR)
 
 # Vive Imports
-from track import ViveTrackerModule
-from fairmotion_ops import conversions, math as fairmotion_math
+try:
+    from track import ViveTrackerModule
+except ImportError:
+    from .track import ViveTrackerModule
 
 # RM Robot Imports
 from Robotic_Arm.rm_robot_interface import *
+
+
+def p2T(position):
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3] = np.asarray(position, dtype=np.float64)
+    return T
+
+
+def invertT(T):
+    T = np.asarray(T, dtype=np.float64)
+    Rm = T[:3, :3]
+    t = T[:3, 3]
+    T_inv = np.eye(4, dtype=np.float64)
+    T_inv[:3, :3] = Rm.T
+    T_inv[:3, 3] = -Rm.T @ t
+    return T_inv
 
 
 class ViveToRMMapper:
@@ -30,8 +48,8 @@ class ViveToRMMapper:
         self.tracker = devices[self.tracker_key]
         
         # Base station origin config
-        self.base_station_origin = conversions.p2T(np.array([3.0, -2.8, -3.0]))
-        self.origin_inv = fairmotion_math.invertT(self.base_station_origin)
+        self.base_station_origin = p2T(np.array([3.0, -2.8, -3.0]))
+        self.origin_inv = invertT(self.base_station_origin)
 
         # 2. Initialize RM Robot
         print(f"Connecting to RM Robot at {robot_ip}:{robot_port}...")

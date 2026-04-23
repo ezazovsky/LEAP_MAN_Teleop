@@ -7,12 +7,11 @@ import json
 from IPython import embed 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-REALMAN_DIR = os.path.join(REPO_ROOT, "RealMan-main")
-if REALMAN_DIR not in sys.path:
-    sys.path.insert(0, REALMAN_DIR)
-
-from fairmotion_utils import constants
 import numpy as np
+
+
+def eye_T():
+    return np.eye(4, dtype=np.float64)
 
 class ViveTrackerModule():
     def __init__(self, configfile_path=None):
@@ -204,7 +203,7 @@ class vr_tracked_device():
         self.device_class = device_class
         self.index = index
         self.vr = vr_obj
-        self.T = constants.eye_T()
+        self.T = eye_T()
 
 
     def get_serial(self):

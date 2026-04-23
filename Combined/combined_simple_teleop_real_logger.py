@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime
+import importlib
 import os
 import sys
 import threading
@@ -16,24 +17,27 @@ except ImportError:
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-REALMAN_DIR = os.path.join(REPO_ROOT, "RealMan-main")
-MANUS_PY_DIR = os.path.join(
-    REPO_ROOT, "RealManus-LEAPHand-main", "Bidex_Manus_Teleop", "python"
-)
+COMBINED_DIR = os.path.dirname(__file__)
+REALMAN_DIR = os.path.join(REPO_ROOT, "RMAPI", "Python")
+MANUS_PY_DIR = os.path.join(REPO_ROOT, "LMAPI", "python")
 
-for path in [REALMAN_DIR, MANUS_PY_DIR]:
+for path in [COMBINED_DIR, REALMAN_DIR, MANUS_PY_DIR]:
     if path not in sys.path:
         sys.path.insert(0, path)
 
+_teleop_import_error = None
 try:
     from teleoperate import ViveToRMMapper  # noqa: E402
-except ImportError:
+except Exception as exc:
+    _teleop_import_error = exc
     ViveToRMMapper = None
 
 try:
-    from leap_hand_utils.dynamixel_client import DynamixelClient  # noqa: E402
-    import leap_hand_utils.leap_hand_utils as lhu  # noqa: E402
-except ImportError:
+    DynamixelClient = importlib.import_module(
+        "leap_hand_utils.dynamixel_client"
+    ).DynamixelClient
+    lhu = importlib.import_module("leap_hand_utils.leap_hand_utils")
+except Exception:
     DynamixelClient = None
     lhu = None
 
@@ -465,7 +469,8 @@ class CombinedSimpleTeleop:
     def setup(self):
         if ViveToRMMapper is None:
             raise RuntimeError(
-                "teleoperate / openvr not installed. Cannot run live teleop."
+                "teleoperate import failed; live teleop unavailable. "
+                f"Root cause: {_teleop_import_error}"
             )
         self.mapper = ViveToRMMapper(
             robot_ip=self.args.robot_ip,

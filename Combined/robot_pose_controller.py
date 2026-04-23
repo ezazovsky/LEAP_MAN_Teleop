@@ -31,6 +31,7 @@ Usage from the command line (single pose test)
 """
 
 import math
+import importlib
 import os
 import sys
 import time
@@ -42,11 +43,10 @@ from scipy.spatial.transform import Rotation as R
 # Path setup — mirror the pattern used in combined_simple_teleop_real_logger
 # ---------------------------------------------------------------------------
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-REALMAN_DIR = os.path.join(REPO_ROOT, "RealMan-main")
-MANUS_PY_DIR = os.path.join(
-    REPO_ROOT, "RealManus-LEAPHand-main", "Bidex_Manus_Teleop", "python"
-)
-for _p in [REALMAN_DIR, MANUS_PY_DIR]:
+COMBINED_DIR = os.path.dirname(__file__)
+REALMAN_DIR = os.path.join(REPO_ROOT, "RMAPI", "Python")
+MANUS_PY_DIR = os.path.join(REPO_ROOT, "LMAPI", "python")
+for _p in [COMBINED_DIR, REALMAN_DIR, MANUS_PY_DIR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -56,9 +56,11 @@ from Robotic_Arm.rm_robot_interface import (  # noqa: E402
 )
 
 try:
-    from leap_hand_utils.dynamixel_client import DynamixelClient
-    import leap_hand_utils.leap_hand_utils as lhu
-except ImportError:
+    DynamixelClient = importlib.import_module(
+        "leap_hand_utils.dynamixel_client"
+    ).DynamixelClient
+    lhu = importlib.import_module("leap_hand_utils.leap_hand_utils")
+except Exception:
     DynamixelClient = None
     lhu = None
 
