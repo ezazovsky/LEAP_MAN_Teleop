@@ -3,4 +3,4 @@
 	url = https://github.com/ezazovsky/RM_API2.git
 [submodule "LMAPI"]
 	path = LMAPI
-	url = https://github.com/leap-hand/Bidex_Manus_Teleop
+	url = https://github.com/ezazovsky/Bidex_Manus_Teleop
