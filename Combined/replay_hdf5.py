@@ -5,8 +5,8 @@ Read a recorded teleoperation HDF5 file and replay the arm + hand movements
 through RobotPoseController, preserving the original timing cadence.
 
 The script performs two phases:
-  1. Homing: smoothly move from current position to the first recorded pose (2 seconds)
-  2. Replay: execute the full recorded trajectory at the original speed
+    1. Move to fixed teleop start joints [0, 25, 90, 0, 60, 0]
+    2. Replay: execute the full recorded trajectory at the original speed
 
 The script feeds arm/smoothed_pose (already safety-filtered during recording)
 and hand/leap_pose into the controller, which still runs them through all the
@@ -43,7 +43,6 @@ import sys
 import time
 
 import numpy as np
-from scipy.spatial.transform import Rotation as R, Slerp
 
 # ---------------------------------------------------------------------------
 # Make sure robot_pose_controller is importable when this script is run from
@@ -60,6 +59,9 @@ except ImportError:
     sys.exit(1)
 
 from robot_pose_controller import RobotPoseController  # noqa: E402
+
+
+START_JOINT_DEG = [0.0, 25.0, 90.0, 0.0, 60.0, 0.0]
 
 
 # ---------------------------------------------------------------------------
@@ -90,22 +92,45 @@ def _print_metadata(meta: dict, n_samples: int, timestamps: np.ndarray):
     print("--------------------------\n")
 
 
-def _interpolate_linear_pose(start: np.ndarray, end: np.ndarray, steps: int) -> list:
-    """Linear interpolation between two 6D poses (with proper angle wrapping for rotations)."""
-    poses = []
-    rot_start = R.from_euler("xyz", start[3:], degrees=False)
-    rot_end = R.from_euler("xyz", end[3:], degrees=False)
-    slerp = Slerp([0.0, 1.0], R.from_quat([rot_start.as_quat(), rot_end.as_quat()]))
+def _move_robot_to_start_joints(ctrl: RobotPoseController):
+    """Move to the same deterministic start joint pose used by live teleoperation."""
+    target_joints = list(START_JOINT_DEG)
+    robot = ctrl.robot
 
-    for i in range(steps + 1):
-        alpha = i / max(1, steps)
-        # Position: simple linear
-        pos = start[:3] + alpha * (end[:3] - start[:3])
-        # Rotation: spherical linear interpolation
-        rot_interp = slerp(alpha)
-        euler = rot_interp.as_euler("xyz", degrees=False)
-        poses.append(np.concatenate([pos, euler]))
-    return poses
+    print(
+        "\n--- Phase 0: Move to teleop start joints ---\n"
+        "Target joints (deg): " + " ".join(f"{v:.1f}" for v in target_joints)
+    )
+
+    move_attempts = [
+        ("rm_movej", (target_joints, 20, 0, 0, 1)),
+        ("rm_movej", (target_joints, 20, 0, 1)),
+        ("rm_movej", (target_joints, 20, 0, 0)),
+        ("rm_movej", (target_joints, 20, 0)),
+        ("rm_movej_p", (target_joints, 20, 0, 0, 1)),
+        ("rm_movej_p", (target_joints, 20, 0, 1)),
+    ]
+
+    last_exc = None
+    for method_name, args in move_attempts:
+        method = getattr(robot, method_name, None)
+        if method is None:
+            continue
+        try:
+            ret = method(*args)
+            if ret == 0:
+                time.sleep(0.5)
+                print("Reached teleop start joints.")
+                return
+            last_exc = RuntimeError(f"{method_name} returned {ret}")
+        except TypeError:
+            continue
+        except Exception as exc:
+            last_exc = exc
+
+    raise RuntimeError(
+        f"Failed to move to teleop start joints {target_joints}. Last error: {last_exc}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +184,11 @@ def replay(
     )
     print(f"Replay settings: trajectory_mode={trajectory_mode}, trajectory_radio={trajectory_radio}")
 
+    # ------------------------------------------------------------------
+    # Phase 0: Move to deterministic teleop start joints
+    # ------------------------------------------------------------------
+    _move_robot_to_start_joints(ctrl)
+
     # Seed safety filter with the first replay pose to avoid huge jump clamps
     first_valid_pose = None
     for i in range(n):
@@ -171,45 +201,9 @@ def replay(
         print(f"Safety filter re-seeded with first replay pose: {[f'{v:.4f}' for v in first_valid_pose]}")
 
     # ------------------------------------------------------------------
-    # Phase 1: Home to start position (smooth interpolation)
+    # Phase 1: Countdown before replay
     # ------------------------------------------------------------------
-    print("\n--- Phase 1: Homing to start position ---")
-    current_pose = ctrl._get_current_arm_pose()
-    if current_pose and first_valid_pose and not np.allclose(current_pose, first_valid_pose, atol=0.01):
-        print(f"Current pose: {[f'{v:.4f}' for v in current_pose]}")
-        print(f"Target pose:  {[f'{v:.4f}' for v in first_valid_pose]}")
-
-        # Create smooth path from current to first replay pose (2-second interpolation)
-        homing_steps = 50  # 50 interpolation steps
-        homing_poses = _interpolate_linear_pose(
-            np.array(current_pose, dtype=np.float64),
-            np.array(first_valid_pose, dtype=np.float64),
-            homing_steps,
-        )
-
-        print(f"Homing: {len(homing_poses)} steps over ~2 seconds...")
-        homing_start = time.perf_counter()
-        for step, pose in enumerate(homing_poses):
-            ret = ctrl.send_arm_pose(
-                pose.tolist(),
-                trajectory_mode=trajectory_mode,
-                trajectory_radio=trajectory_radio,
-            )
-            if ret != 0:
-                print(f"\n[WARNING] CANFD error during homing at step {step}: {ret}")
-                break
-            # Space out homing commands over ~2 seconds
-            target_time = homing_start + (step / len(homing_poses)) * 2.0
-            while time.perf_counter() < target_time:
-                pass
-        print(f"Homing complete in {time.perf_counter() - homing_start:.2f}s")
-    else:
-        print("Already at or very close to start position, skipping homing.")
-
-    # ------------------------------------------------------------------
-    # Phase 2: Countdown before replay
-    # ------------------------------------------------------------------
-    print(f"\n--- Phase 2: Replay ({n} samples) ---")
+    print(f"\n--- Phase 1: Replay ({n} samples) ---")
     print(f"Starting replay in {start_delay:.0f} seconds — press Ctrl+C to abort.")
     deadline = time.perf_counter() + start_delay
     while time.perf_counter() < deadline:
@@ -222,8 +216,6 @@ def replay(
     # Replay loop
     # ------------------------------------------------------------------
     replay_wall_start = time.perf_counter()
-    rec_t0 = float(timestamps[0])
-
     try:
         for i in range(n):
             loop_t = time.perf_counter()
