@@ -1,0 +1,6 @@
+[submodule "RMAPI"]
+	path = RMAPI
+	url = https://github.com/ezazovsky/RM_API2.git
+[submodule "LMAPI"]
+	path = LMAPI
+	url = https://github.com/ezazovsky/Bidex_Manus_Teleop

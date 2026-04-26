@@ -1,6 +1,10 @@
 import argparse
 from datetime import datetime
+import importlib
+import multiprocessing as mp
+from multiprocessing import shared_memory
 import os
+from queue import Empty, Full
 import sys
 import threading
 import time
@@ -14,155 +18,241 @@ try:
 except ImportError:
     h5py = None
 
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
+
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-REALMAN_DIR = os.path.join(REPO_ROOT, "RealMan-main")
-MANUS_PY_DIR = os.path.join(
-    REPO_ROOT, "RealManus-LEAPHand-main", "Bidex_Manus_Teleop", "python"
-)
+COMBINED_DIR = os.path.dirname(__file__)
+REALMAN_DIR = os.path.join(REPO_ROOT, "RMAPI", "Python")
+MANUS_PY_DIR = os.path.join(REPO_ROOT, "LMAPI", "python")
 
-for path in [REALMAN_DIR, MANUS_PY_DIR]:
+DEFAULT_CAMERA_WIDTH = 640
+DEFAULT_CAMERA_HEIGHT = 480
+DEFAULT_CAMERA_FPS = 30
+
+for path in [COMBINED_DIR, REALMAN_DIR, MANUS_PY_DIR]:
     if path not in sys.path:
         sys.path.insert(0, path)
 
+_teleop_import_error = None
 try:
     from teleoperate import ViveToRMMapper  # noqa: E402
-except ImportError:
+except Exception as exc:
+    _teleop_import_error = exc
     ViveToRMMapper = None
 
 try:
-    from leap_hand_utils.dynamixel_client import DynamixelClient  # noqa: E402
-    import leap_hand_utils.leap_hand_utils as lhu  # noqa: E402
-except ImportError:
+    DynamixelClient = importlib.import_module(
+        "leap_hand_utils.dynamixel_client"
+    ).DynamixelClient
+    lhu = importlib.import_module("leap_hand_utils.leap_hand_utils")
+except Exception:
     DynamixelClient = None
     lhu = None
 
 
-class TeleopHDF5Logger:
-    """
-    Streams teleoperation samples into an HDF5 file using resizable datasets.
-    """
+class RealSenseCamera:
+    """RGB-only capture wrapper for Intel RealSense with IR Emitter explicitly disabled."""
+    def __init__(self, width=640, height=480, fps=30):
+        if rs is None:
+            raise RuntimeError("pyrealsense2 is not installed.")
 
-    def __init__(self, output_path, args):
-        if h5py is None:
-            raise RuntimeError(
-                "HDF5 logging requested, but h5py is not installed. "
-                "Install it with: pip install h5py"
-            )
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = int(fps)
 
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        
+        # ONLY enable color stream to save USB bandwidth
+        config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+        
+        # Start pipeline
+        profile = self.pipeline.start(config)
+
+        # THE CRITICAL FIX: Explicitly disable the IR Emitter to prevent Vive Tracker blinding
+        device = profile.get_device()
+        for sensor in device.query_sensors():
+            if sensor.is_depth_sensor():
+                if sensor.supports(rs.option.emitter_enabled):
+                    sensor.set_option(rs.option.emitter_enabled, 0) # 0 = Off
+
+    def get_camera_obs(self):
+        frames = self.pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        
+        if not color_frame:
+            return None
+
+        return {
+            "timestamp_ns": time.time_ns(),
+            "color": np.asanyarray(color_frame.get_data()),
+        }
+
+    def close(self):
+        if getattr(self, "pipeline", None) is not None:
+            self.pipeline.stop()
+            self.pipeline = None
+
+# --- Shared Memory Utilities ---
+def create_shm(name, size):
+    try:
+        shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+    except FileExistsError:
+        shm = shared_memory.SharedMemory(name=name)
+        shm.unlink()
+        shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+    return shm
+
+class CameraProcess(mp.Process):
+    """Writes RGB camera frames directly to Shared Memory at 30Hz."""
+    def __init__(self, stop_event, ts_value, width=640, height=480, fps=30):
+        super().__init__(daemon=True)
+        self.stop_event = stop_event
+        self.ts_value = ts_value
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = int(fps)
+
+        self.color_size = self.width * self.height * 3
+
+    def run(self):
+        camera = None
+        color_shm = None
+        try:
+            color_shm = create_shm('cam_color_shm', self.color_size)
+            color_arr = np.ndarray((self.height, self.width, 3), dtype=np.uint8, buffer=color_shm.buf)
+
+            camera = RealSenseCamera(width=self.width, height=self.height, fps=self.fps)
+            
+            while not self.stop_event.is_set():
+                obs = camera.get_camera_obs()
+                if obs is None:
+                    continue
+
+                # Write directly to memory without locking (tearing risk is minimal for RGB logs)
+                np.copyto(color_arr, obs["color"])
+                self.ts_value.value = obs["timestamp_ns"]
+
+        finally:
+            if camera is not None:
+                camera.close()
+            if color_shm is not None:
+                color_shm.close()
+                color_shm.unlink()
+
+
+class HDF5LoggingProcess(mp.Process):
+    """Dedicated process for HDF5 disk I/O. Pulls from SHM and queues without blocking teleop."""
+    def __init__(self, log_queue, stop_event, output_path, args, width, height):
+        super().__init__(daemon=True)
+        self.log_queue = log_queue
+        self.stop_event = stop_event
         self.output_path = output_path
-        self.sample_count = 0
-        self.flush_every = max(1, int(args.log_flush_every))
+        self.args = args
+        self.width = width
+        self.height = height
+
+    def run(self):
+        if h5py is None:
+            print("[WARNING] h5py not installed. Logging Process exiting.")
+            return
 
         dir_path = os.path.dirname(self.output_path)
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
-        self.file = h5py.File(self.output_path, "w")
 
-        self.file.attrs["created_utc"] = datetime.utcnow().isoformat() + "Z"
-        self.file.attrs["robot_ip"] = args.robot_ip
-        self.file.attrs["robot_port"] = args.robot_port
-        self.file.attrs["zmq_endpoint"] = args.zmq_endpoint
-        self.file.attrs["hand_side"] = args.hand_side
-        self.file.attrs["control_hz"] = args.control_hz
-        self.file.attrs["arm_pos_scale"] = args.arm_pos_scale
-        self.file.attrs["arm_rot_scale"] = args.arm_rot_scale
-        self.file.attrs["calibration_countdown"] = args.calibration_countdown
-        self.file.attrs["hand_current_limit"] = args.hand_current_limit
-        self.file.attrs["script"] = "combined_simple_teleop_real_logger.py"
+        file = h5py.File(self.output_path, "w")
+        flush_every = max(1, int(self.args.log_flush_every))
+        sample_count = 0
+        last_logged_cam_ts = 0
 
-        self.datasets = {
-            "time/monotonic_s": self._create_dataset("time/monotonic_s", (0,), (None,), np.float64),
-            "time/wall_time_s": self._create_dataset("time/wall_time_s", (0,), (None,), np.float64),
-            "arm/raw_pose": self._create_dataset("arm/raw_pose", (0, 6), (None, 6), np.float64),
-            "arm/bounded_pose": self._create_dataset("arm/bounded_pose", (0, 6), (None, 6), np.float64),
-            "arm/safe_pose": self._create_dataset("arm/safe_pose", (0, 6), (None, 6), np.float64),
-            "arm/smoothed_pose": self._create_dataset("arm/smoothed_pose", (0, 6), (None, 6), np.float64),
-            "arm/hold_flag": self._create_dataset("arm/hold_flag", (0,), (None,), np.bool_),
-            "arm/canfd_status": self._create_dataset("arm/canfd_status", (0,), (None,), np.int32),
-            "hand/manus_joints": self._create_dataset("hand/manus_joints", (0, 20), (None, 20), np.float64),
-            "hand/leap_pose": self._create_dataset("hand/leap_pose", (0, 16), (None, 16), np.float64),
-            "hand/has_glove_data": self._create_dataset("hand/has_glove_data", (0,), (None,), np.bool_),
+        color_shm = None
+        local_color = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+        # Basic metadata
+        file.attrs["created_utc"] = datetime.utcnow().isoformat() + "Z"
+        file.attrs["robot_ip"] = self.args.robot_ip
+        file.attrs["control_hz"] = self.args.control_hz
+        
+        datasets = {
+            "time/monotonic_s": file.create_dataset("time/monotonic_s", (0,), maxshape=(None,), dtype=np.float64, chunks=True),
+            "arm/safe_pose": file.create_dataset("arm/safe_pose", (0, 6), maxshape=(None, 6), dtype=np.float64, chunks=True),
+            "arm/smoothed_pose": file.create_dataset("arm/smoothed_pose", (0, 6), maxshape=(None, 6), dtype=np.float64, chunks=True),
+            "hand/manus_joints": file.create_dataset("hand/manus_joints", (0, 20), maxshape=(None, 20), dtype=np.float64, chunks=True),
+            "hand/leap_pose": file.create_dataset("hand/leap_pose", (0, 16), maxshape=(None, 16), dtype=np.float64, chunks=True),
+            "camera/timestamp_ns": file.create_dataset("camera/timestamp_ns", (0,), maxshape=(None,), dtype=np.uint64, chunks=True),
         }
 
-    def _create_dataset(self, name, shape, maxshape, dtype):
-        return self.file.create_dataset(
-            name=name,
-            shape=shape,
-            maxshape=maxshape,
-            dtype=dtype,
-            chunks=True,
-        )
+        if self.args.enable_camera:
+            datasets["camera/color"] = file.create_dataset(
+                "camera/color", (0, self.height, self.width, 3), maxshape=(None, self.height, self.width, 3),
+                dtype=np.uint8, chunks=(1, self.height, self.width, 3), compression="lzf"
+            )
 
-    def append_sample(
-        self,
-        monotonic_s,
-        wall_time_s,
-        raw_pose,
-        bounded_pose,
-        safe_pose,
-        smoothed_pose,
-        hold_flag,
-        canfd_status,
-        glove_message,
-        leap_pose,
-    ):
-        index = self.sample_count
+            # Wait for CameraProcess to initialize shared memory
+            while not self.stop_event.is_set():
+                try:
+                    color_shm = shared_memory.SharedMemory(name='cam_color_shm')
+                    break
+                except FileNotFoundError:
+                    time.sleep(0.1)
+            
+            if color_shm:
+                color_arr = np.ndarray((self.height, self.width, 3), dtype=np.uint8, buffer=color_shm.buf)
 
-        values = {
-            "time/monotonic_s": float(monotonic_s),
-            "time/wall_time_s": float(wall_time_s),
-            "arm/raw_pose": np.asarray(
-                raw_pose if raw_pose is not None else [np.nan] * 6, dtype=np.float64
-            ),
-            "arm/bounded_pose": np.asarray(
-                bounded_pose if bounded_pose is not None else [np.nan] * 6, dtype=np.float64
-            ),
-            "arm/safe_pose": np.asarray(
-                safe_pose if safe_pose is not None else [np.nan] * 6, dtype=np.float64
-            ),
-            "arm/smoothed_pose": np.asarray(
-                smoothed_pose if smoothed_pose is not None else [np.nan] * 6, dtype=np.float64
-            ),
-            "arm/hold_flag": bool(hold_flag),
-            "arm/canfd_status": int(canfd_status),
-            "hand/manus_joints": np.asarray(
-                glove_message if glove_message is not None else [np.nan] * 20,
-                dtype=np.float64,
-            ),
-            "hand/leap_pose": np.asarray(
-                leap_pose if leap_pose is not None else [np.nan] * 16,
-                dtype=np.float64,
-            ),
-            "hand/has_glove_data": bool(glove_message is not None),
-        }
+        try:
+            while True:
+                try:
+                    data = self.log_queue.get(timeout=0.5)
+                    if data is None:  # Sentinel value for shutdown
+                        break
+                except Empty:
+                    if self.stop_event.is_set():
+                        break
+                    continue
 
-        for name, value in values.items():
-            dataset = self.datasets[name]
-            new_shape = list(dataset.shape)
-            new_shape[0] = index + 1
-            dataset.resize(tuple(new_shape))
-            dataset[index] = value
+                cam_ts = data.get("camera_ts", 0)
+                
+                # Copy from SHM only if it's a new frame to avoid redundant disk writes
+                if self.args.enable_camera and color_shm and cam_ts != last_logged_cam_ts and cam_ts != 0:
+                    np.copyto(local_color, color_arr)
+                    last_logged_cam_ts = cam_ts
 
-        self.sample_count += 1
+                # Resize and write datasets
+                idx = sample_count
+                for name, value in data["arrays"].items():
+                    ds = datasets[name]
+                    ds.resize((idx + 1, *ds.shape[1:]))
+                    ds[idx] = value
 
-        if self.sample_count % self.flush_every == 0:
-            self.file.flush()
+                if self.args.enable_camera and color_shm:
+                    ds_c = datasets["camera/color"]
+                    ds_ts = datasets["camera/timestamp_ns"]
+                    
+                    ds_c.resize((idx + 1, *ds_c.shape[1:]))
+                    ds_ts.resize((idx + 1,))
+                    
+                    ds_c[idx] = local_color
+                    ds_ts[idx] = cam_ts
 
-    def close(self):
-        if getattr(self, "file", None) is not None:
-            self.file.attrs["sample_count"] = self.sample_count
-            self.file.flush()
-            self.file.close()
-            self.file = None
+                sample_count += 1
+                if sample_count % flush_every == 0:
+                    file.flush()
+
+        finally:
+            file.attrs["sample_count"] = sample_count
+            file.flush()
+            file.close()
+            if color_shm is not None:
+                color_shm.close()
 
 
 class ManusErgonomicsSubscriber:
-    """
-    Reads the 40-value MANUS ergonomics stream in a background thread and
-    exposes the latest 20-value hand slice.
-    """
-
+    """Reads MANUS ergonomics stream."""
     def __init__(self, endpoint="tcp://localhost:8000", hand_side="right"):
         self.endpoint = endpoint
         self.hand_side = hand_side
@@ -203,30 +293,18 @@ class ManusErgonomicsSubscriber:
 
 
 class LeapHandDirectController:
-    """
-    Minimal LEAP Hand controller copied in spirit from the MANUS example:
-    direct joint-angle mapping, no retargeting or IK.
-    """
-
+    """Minimal LEAP Hand controller."""
     def __init__(self, hand_port=None, current_limit=350):
         if DynamixelClient is None or lhu is None:
-            raise RuntimeError(
-                "leap_hand_utils not installed. Cannot run live LEAP Hand control."
-            )
-        self.kP = 400
-        self.kI = 0
-        self.kD = 300
+            raise RuntimeError("leap_hand_utils not installed.")
         self.curr_lim = current_limit
         self.motors = list(range(16))
         self.curr_pos = lhu.allegro_to_LEAPhand(np.zeros(16))
         self.last_command = np.array(self.curr_pos, dtype=np.float64)
 
-        port_candidates = []
-        if hand_port:
-            port_candidates.append(hand_port)
+        port_candidates = [hand_port] if hand_port else []
         port_candidates.extend(["/dev/ttyUSB0", "/dev/ttyUSB1", "COM13"])
 
-        last_error = None
         self.dxl_client = None
         for candidate in port_candidates:
             try:
@@ -234,48 +312,21 @@ class LeapHandDirectController:
                 self.dxl_client.connect()
                 self.port = candidate
                 break
-            except Exception as exc:
-                last_error = exc
+            except Exception:
                 self.dxl_client = None
 
         if self.dxl_client is None:
-            raise RuntimeError(f"Failed to connect to LEAP Hand: {last_error}")
+            raise RuntimeError("Failed to connect to LEAP Hand on any port.")
 
         self.dxl_client.sync_write(self.motors, np.ones(len(self.motors)) * 5, 11, 1)
         self.dxl_client.set_torque_enabled(self.motors, True)
-        self.dxl_client.sync_write(
-            self.motors, np.ones(len(self.motors)) * self.kP, 84, 2
-        )
-        self.dxl_client.sync_write([0, 4, 8], np.ones(3) * (self.kP * 0.75), 84, 2)
-        self.dxl_client.sync_write(
-            self.motors, np.ones(len(self.motors)) * self.kI, 82, 2
-        )
-        self.dxl_client.sync_write(
-            self.motors, np.ones(len(self.motors)) * self.kD, 80, 2
-        )
-        self.dxl_client.sync_write([0, 4, 8], np.ones(3) * (self.kD * 0.75), 80, 2)
-        self.dxl_client.sync_write(
-            self.motors, np.ones(len(self.motors)) * self.curr_lim, 102, 2
-        )
         self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
 
-    def convert_manus_to_leap_pose(self, hand_joints):
-        """
-        Direct-copy mapping from MANUS ergonomics data to LEAP-Hand-compatible
-        Allegro-style joint ordering. This follows the simple demo approach.
-        """
-
-        if len(hand_joints) != 20:
-            raise ValueError(f"Expected 20 MANUS joint values, got {len(hand_joints)}")
-
+    def send_manus_command(self, hand_joints):
         pose = np.deg2rad(
-            hand_joints[4:8]
-            + [hand_joints[8] + 10]
-            + hand_joints[9:16]
-            + [90 - 1.75 * hand_joints[1]]
-            + [-45 + 3.0 * hand_joints[0]]
-            + [-30 + 3.0 * hand_joints[2]]
-            + [hand_joints[3]]
+            hand_joints[4:8] + [hand_joints[8] + 10] + hand_joints[9:16] +
+            [90 - 1.75 * hand_joints[1]] + [-45 + 3.0 * hand_joints[0]] +
+            [-30 + 3.0 * hand_joints[2]] + [hand_joints[3]]
         )
         pose[0] = -2.5 * pose[0] + np.deg2rad(20)
         pose[1] = 1.5 * pose[1]
@@ -285,43 +336,49 @@ class LeapHandDirectController:
         pose[9] = 1.5 * pose[9]
         pose[12] = 1.5 * pose[12]
         pose[13] = 1.5 * pose[13] + np.deg2rad(90)
-        return lhu.allegro_to_LEAPhand(pose, zeros=False)
-
-    def send_manus_command(self, hand_joints):
-        leap_pose = self.convert_manus_to_leap_pose(hand_joints)
+        
+        leap_pose = lhu.allegro_to_LEAPhand(pose, zeros=False)
         self.curr_pos = np.array(leap_pose)
         self.last_command = self.curr_pos.copy()
         self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
         return self.last_command
+    def disconnect(self):
+        """Aggressively release the serial port to prevent Zombie USB locks."""
+        if self.dxl_client is not None:
+            try:
+                # 1. Turn off torque so motors don't freeze the bus
+                self.dxl_client.set_torque_enabled(self.motors, False)
+                time.sleep(0.1)
+                
+                # 2. Standard disconnect
+                self.dxl_client.disconnect()
+            except Exception:
+                pass
+            
+            # 3. Aggressive Serial Port Release
+            try:
+                if hasattr(self.dxl_client, 'portHandler'):
+                    self.dxl_client.portHandler.closePort()
+            except Exception:
+                pass
 
 
 class HighFrequencyInterpolator:
-    """
-    Exponential Moving Average (EMA) to upsample the lower-frequency 
-    VR tracker data into a smooth, high-frequency stream for the robot.
-    Optimized strictly for 6D poses [X, Y, Z, Rx, Ry, Rz] with position EMA
-    and quaternion SLERP for rotation.
-    """
     def __init__(self, alpha_pos=0.15, alpha_rot=0.15):
         self.current_pose = None
         self.alpha_pos = alpha_pos
         self.alpha_rot = alpha_rot
 
     def step(self, target_pose):
-        # Convert target to a flat numpy array to avoid list reference bugs
         target = np.array(target_pose, dtype=np.float64)
-
         if self.current_pose is None:
             self.current_pose = target.copy()
             return self.current_pose.tolist()
 
-        # 1. Position Interpolation (X, Y, Z) - Standard Linear EMA
         self.current_pose[:3] += self.alpha_pos * (target[:3] - self.current_pose[:3])
-
-        # 2. Rotation Interpolation (Rx, Ry, Rz) - Quaternion SLERP
+        
         t = float(np.clip(self.alpha_rot, 0.0, 1.0))
-        if t <= 0.0:
-            return self.current_pose.tolist()
+        if t <= 0.0: return self.current_pose.tolist()
         if t >= 1.0:
             self.current_pose[3:] = target[3:]
             return self.current_pose.tolist()
@@ -330,7 +387,6 @@ class HighFrequencyInterpolator:
         rot_targ = R.from_euler("xyz", target[3:], degrees=False)
         slerp = Slerp([0.0, 1.0], R.from_quat([rot_curr.as_quat(), rot_targ.as_quat()]))
         self.current_pose[3:] = slerp(t).as_euler("xyz", degrees=False)
-
         return self.current_pose.tolist()
 
 
@@ -342,28 +398,28 @@ class CombinedSimpleTeleop:
         self.mapper = None
         self.hand = None
         self.glove = None
-        self.logger = None
         self.interpolator = HighFrequencyInterpolator()
+        self._last_cmd_pose = None
+        self._last_recovery_t = 0.0
 
-    @staticmethod
-    def _pose_snapshot(pose):
-        if pose is None:
-            return None
-        return np.asarray(pose, dtype=np.float64).copy().tolist()
+        # Subprocess Management
+        self.sys_stop_event = mp.Event()
+        
+        # THE IPC FIX: Use RawValue to completely bypass Python's GIL and Mutex locks
+        self.cam_ts_val = mp.RawValue('Q', 0)
+        
+        self.log_queue = mp.Queue(maxsize=5000)
+        self.camera_proc = None
+        self.logger_proc = None
 
     def _compute_raw_pose(self):
         current_T = self.mapper.get_current_tracker_matrix()
         T_delta = np.linalg.inv(self.mapper.tracker_home_T) @ current_T
         pos_delta = T_delta[:3, 3]
 
-        remapped_pos = np.array(
-            [-pos_delta[1], -pos_delta[0], -pos_delta[2]], dtype=np.float64
-        ) * self.mapper.pos_scale
-
+        remapped_pos = np.array([-pos_delta[1], -pos_delta[0], -pos_delta[2]], dtype=np.float64) * self.mapper.pos_scale
         rotvec_delta = R.from_matrix(T_delta[:3, :3]).as_rotvec()
-        remapped_rotvec = np.array(
-            [-rotvec_delta[1], -rotvec_delta[0], -rotvec_delta[2]], dtype=np.float64
-        ) * self.mapper.rot_scale
+        remapped_rotvec = np.array([-rotvec_delta[1], -rotvec_delta[0], -rotvec_delta[2]], dtype=np.float64) * self.mapper.rot_scale
         euler_delta = R.from_rotvec(remapped_rotvec).as_euler("xyz", degrees=False)
 
         target_pose = np.asarray(self.mapper.robot_home_pose, dtype=np.float64).copy()
@@ -372,243 +428,137 @@ class CombinedSimpleTeleop:
         return target_pose.tolist()
 
     def _move_robot_to_start_joints(self):
-        """Move to a fixed, known-safe start joint pose before teleop calibration."""
         target_joints = list(self.START_JOINT_DEG)
         robot = self.mapper.robot
-
-        print(
-            "\nMoving arm to start joints (deg): "
-            + " ".join(f"{v:.1f}" for v in target_joints)
-        )
-
-        move_attempts = [
-            ("rm_movej", (target_joints, 20, 0, 0, 1)),
-            ("rm_movej", (target_joints, 20, 0, 1)),
-            ("rm_movej", (target_joints, 20, 0, 0)),
-            ("rm_movej", (target_joints, 20, 0)),
-            ("rm_movej_p", (target_joints, 20, 0, 0, 1)),
-            ("rm_movej_p", (target_joints, 20, 0, 1)),
-        ]
-
-        last_exc = None
-        for method_name, args in move_attempts:
+        print("\nMoving arm to start joints (deg): " + " ".join(f"{v:.1f}" for v in target_joints))
+        
+        for method_name, args in [("rm_movej", (target_joints, 20, 0, 0, 1)), ("rm_movej_p", (target_joints, 20, 0, 1))]:
             method = getattr(robot, method_name, None)
-            if method is None:
-                continue
-            try:
-                ret = method(*args)
-                if ret == 0:
-                    time.sleep(0.5)
-                    return
-                last_exc = RuntimeError(f"{method_name} returned {ret}")
-            except TypeError:
-                continue
-            except Exception as exc:
-                last_exc = exc
-
-        raise RuntimeError(
-            f"Failed to move to start joints {target_joints}. Last error: {last_exc}"
-        )
+            if method:
+                try:
+                    if method(*args) == 0:
+                        time.sleep(0.5)
+                        return
+                except Exception:
+                    continue
 
     def setup(self):
-        if ViveToRMMapper is None:
-            raise RuntimeError(
-                "teleoperate / openvr not installed. Cannot run live teleop."
-            )
-        self.mapper = ViveToRMMapper(
-            robot_ip=self.args.robot_ip,
-            robot_port=self.args.robot_port,
-        )
+        self.mapper = ViveToRMMapper(robot_ip=self.args.robot_ip, robot_port=self.args.robot_port)
         self.mapper.pos_scale = self.args.arm_pos_scale
         self.mapper.rot_scale = self.args.arm_rot_scale
 
-        # Force a deterministic start posture before calibration/teleop.
         self._move_robot_to_start_joints()
+        
+        # Strict Hardware Requirement for the LEAP Hand
+        self.hand = LeapHandDirectController(hand_port=self.args.hand_port, current_limit=self.args.hand_current_limit)
+        print("LEAP Hand connected successfully.")
+            
+        self.glove = ManusErgonomicsSubscriber(endpoint=self.args.zmq_endpoint, hand_side=self.args.hand_side)
 
-        self.hand = LeapHandDirectController(
-            hand_port=self.args.hand_port,
-            current_limit=self.args.hand_current_limit,
-        )
-        self.glove = ManusErgonomicsSubscriber(
-            endpoint=self.args.zmq_endpoint,
-            hand_side=self.args.hand_side,
-        )
+        log_path = self.args.log_path or os.path.join(REPO_ROOT, "Combined", "logs", f"teleop_{datetime.now().strftime('%Y%m%d_%H%M%S')}.hdf5")
+        
+        # Start Subprocesses
+        if self.args.enable_camera:
+            self.camera_proc = CameraProcess(self.sys_stop_event, self.cam_ts_val, DEFAULT_CAMERA_WIDTH, DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_FPS)
+            self.camera_proc.start()
+
         if self.args.log_hdf5:
-            log_path = self.args.log_path or self._default_log_path()
-            self.logger = TeleopHDF5Logger(log_path, self.args)
-            print(f"HDF5 logging enabled: {log_path}")
+            self.logger_proc = HDF5LoggingProcess(self.log_queue, self.sys_stop_event, log_path, self.args, DEFAULT_CAMERA_WIDTH, DEFAULT_CAMERA_HEIGHT)
+            self.logger_proc.start()
+            print(f"HDF5 Async Logger started: {log_path}")
 
-        initial_pose = self.mapper.get_current_robot_pose()
-        if initial_pose:
-            time.sleep(1)
-
+        time.sleep(1)
         self.mapper.calibrate(countdown=self.args.calibration_countdown)
-
-        if self.logger is not None:
-            self.logger.file.attrs["tracker_key"] = getattr(self.mapper, "tracker_key", "")
-            self.logger.file.attrs["robot_home_pose"] = np.asarray(
-                self.mapper.robot_home_pose, dtype=np.float64
-            )
-            self.logger.file.attrs["tracker_home_T"] = np.asarray(
-                self.mapper.tracker_home_T, dtype=np.float64
-            )
-
-    def _default_log_path(self):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(REPO_ROOT, "Combined", "logs", f"teleop_{timestamp}.hdf5")
+        self._last_cmd_pose = list(self.mapper.robot_home_pose)
 
     def run(self):
         self.setup()
-        print(
-            f"\nCombined teleop running at {self.args.control_hz:.1f} Hz. "
-            "Press Ctrl+C to stop."
-        )
-
+        print(f"\nCombined teleop running at {self.args.control_hz:.1f} Hz. Press Ctrl+C to stop.")
         dt = 1.0 / self.args.control_hz
-        warned_no_glove = False
 
         while True:
             loop_start = time.perf_counter()
-            wall_time_s = time.time()
-
-            raw_pose = None
-            bounded_pose = None
-            try:
-                raw_pose = self._compute_raw_pose()
-                # teleoperate.py is used here as a safety utility only.
-                bounded_pose = self.mapper.apply_safety_bounds(raw_pose)
-            except Exception as exc:
-                print(f"\n[WARNING] Falling back to hold pose: {exc}")
-
-            if bounded_pose is not None:
-                safe_pose = bounded_pose
-                is_holding = False
-            else:
-                safe_pose = self.mapper.last_filtered_pose or self.mapper.robot_home_pose
-                is_holding = True
-
+            
+            raw_pose = self._compute_raw_pose()
+            safe_pose = self.mapper.apply_safety_bounds(raw_pose) or self.mapper.last_filtered_pose or self.mapper.robot_home_pose
             smoothed_pose = self.interpolator.step(safe_pose)
 
-            raw_pose_log = self._pose_snapshot(raw_pose)
-            bounded_pose_log = self._pose_snapshot(bounded_pose)
-            safe_pose_log = self._pose_snapshot(safe_pose)
-            smoothed_pose_log = self._pose_snapshot(smoothed_pose)
+            # Send Command
+            arm_ret = self.mapper.robot.rm_movep_canfd(smoothed_pose, True, 1, 20)
 
-            # trajectory_mode=1 (curve fitting), radio=20 (reduced buffer)
-            arm_ret = self.mapper.robot.rm_movep_canfd(smoothed_pose_log, True, 1, 20)
-            
-            if arm_ret != 0:
-                if self.logger is not None:
-                    self.logger.append_sample(
-                        monotonic_s=loop_start,
-                        wall_time_s=wall_time_s,
-                        raw_pose=raw_pose_log,
-                        bounded_pose=bounded_pose_log,
-                        safe_pose=safe_pose_log,
-                        smoothed_pose=smoothed_pose_log,
-                        hold_flag=is_holding,
-                        canfd_status=arm_ret,
-                        glove_message=self.glove.message,
-                        leap_pose=self.hand.last_command,
-                    )
-                print(f"\nCANFD transmission error: {arm_ret}")
-                break
-
+            # Process Glove/Hand
             glove_message = self.glove.message
-            leap_pose = self.hand.last_command
-            if glove_message is not None:
-                warned_no_glove = False
+            leap_pose = self.hand.last_command if self.hand else None
+            
+            if glove_message is not None and self.hand is not None:
                 leap_pose = self.hand.send_manus_command(glove_message)
-            elif not warned_no_glove:
-                print("\nWaiting for MANUS ergonomics data on ZMQ...")
-                warned_no_glove = True
 
-            if self.logger is not None:
-                self.logger.append_sample(
-                    monotonic_s=loop_start,
-                    wall_time_s=wall_time_s,
-                    raw_pose=raw_pose_log,
-                    bounded_pose=bounded_pose_log,
-                    safe_pose=safe_pose_log,
-                    smoothed_pose=smoothed_pose_log,
-                    hold_flag=is_holding,
-                    canfd_status=arm_ret,
-                    glove_message=glove_message,
-                    leap_pose=leap_pose,
-                )
+            # Lightweight Logging Push
+            if self.logger_proc and self.logger_proc.is_alive():
+                log_data = {
+                    "camera_ts": self.cam_ts_val.value,
+                    "arrays": {
+                        "time/monotonic_s": np.float64(loop_start),
+                        "arm/safe_pose": np.asarray(safe_pose, dtype=np.float64),
+                        "arm/smoothed_pose": np.asarray(smoothed_pose, dtype=np.float64),
+                        "hand/manus_joints": np.asarray(glove_message if glove_message else [np.nan]*20, dtype=np.float64),
+                        "hand/leap_pose": np.asarray(leap_pose if leap_pose is not None else [np.nan]*16, dtype=np.float64),
+                    }
+                }
+                try:
+                    self.log_queue.put_nowait(log_data)
+                except Full:
+                    pass # Drop frame instead of lagging the arm
 
-            if is_holding:
-                print(
-                    "\r[WARNING] Arm boundary limit active. Hand still streaming.   ",
-                    end="",
-                    flush=True,
-                )
-            else:
-                formatted_pose = " ".join(f"{val:.4f}" for val in smoothed_pose_log)
-                glove_state = "hand:on" if glove_message is not None else "hand:wait"
-                print(
-                    f"\rArm: {formatted_pose}   {glove_state}   ",
-                    end="",
-                    flush=True,
-                )
-
-            # Precision Spin-Wait Loop to guarantee sub-millisecond execution timing
-            target_time = loop_start + dt
-            while time.perf_counter() < target_time:
+            # Spin Wait
+            while time.perf_counter() < loop_start + dt:
                 pass
+
     def shutdown(self):
-        if self.logger is not None:
-            self.logger.close()
-        if self.glove is not None:
-            self.glove.close()
-        if self.mapper is not None:
-            try:
-                self.mapper.robot.rm_delete_robot_arm()
-            except Exception:
-                pass
-        print("\nDisconnected.")
-
+        print("\nInitiating safe teardown...")
+        self.sys_stop_event.set()
+        
+        if self.logger_proc:
+            self.log_queue.put(None) # Sentinel
+            self.logger_proc.join(timeout=2.0)
+            
+        if self.camera_proc:
+            self.camera_proc.join(timeout=2.0)
+            
+        if self.glove: self.glove.close()
+        if self.mapper:
+            try: self.mapper.robot.rm_delete_robot_arm()
+            except: pass
+        print("Disconnected.")
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        description="Simple combined teleop: Vive tracker arm + MANUS direct-copy LEAP Hand"
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument("--robot-ip", default="192.168.1.18")
     parser.add_argument("--robot-port", type=int, default=8080)
     parser.add_argument("--zmq-endpoint", default="tcp://localhost:8000")
     parser.add_argument("--hand-side", choices=["left", "right"], default="right")
     parser.add_argument("--hand-port", default=None)
-    # Kept at 125.0 Hz to meet CANFD < 10ms cycle requirement
     parser.add_argument("--control-hz", type=float, default=125.0)
     parser.add_argument("--calibration-countdown", type=int, default=3)
     parser.add_argument("--arm-pos-scale", type=float, default=1.0)
     parser.add_argument("--arm-rot-scale", type=float, default=1.0)
     parser.add_argument("--hand-current-limit", type=int, default=350)
-    parser.add_argument(
-        "--log-hdf5", action="store_true", default=True,
-        help="Enable HDF5 logging (on by default). Pass --no-log-hdf5 to disable.",
-    )
-    parser.add_argument(
-        "--no-log-hdf5", dest="log_hdf5", action="store_false",
-        help="Disable HDF5 logging.",
-    )
+    parser.add_argument("--log-hdf5", action="store_true", default=True)
     parser.add_argument("--log-path", default=None)
     parser.add_argument("--log-flush-every", type=int, default=50)
+    parser.add_argument("--enable-camera", action="store_true", default=False)
     return parser
 
-
 def main():
+    mp.set_start_method('spawn', force=True) # Ensure clean memory space on Windows/Linux
     args = build_parser().parse_args()
     teleop = CombinedSimpleTeleop(args)
     try:
         teleop.run()
     except KeyboardInterrupt:
-        print("\nTeleoperation stopped by user.")
-    except Exception as exc:
-        print(f"\nError: {exc}")
+        pass
     finally:
         teleop.shutdown()
-
 
 if __name__ == "__main__":
     main()
