@@ -15,6 +15,11 @@ try:
 except ImportError:
     h5py = None
 
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
+
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 COMBINED_DIR = os.path.dirname(__file__)
@@ -40,6 +45,134 @@ try:
 except Exception:
     DynamixelClient = None
     lhu = None
+
+
+class RealSenseD435iCapture:
+    """
+    Captures RGB and depth frames from Intel RealSense D435i in a background thread.
+    Applies frame synchronization and stores latest frame with timestamp.
+    """
+
+    def __init__(
+        self,
+        width=640,
+        height=480,
+        fps=30,
+        enable_rgb=True,
+        enable_depth=True,
+    ):
+        if rs is None:
+            raise RuntimeError(
+                "RealSense support requested but pyrealsense2 not installed. "
+                "Install with: pip install pyrealsense2"
+            )
+
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.enable_rgb = enable_rgb
+        self.enable_depth = enable_depth
+
+        self._latest_frame = None
+        self._latest_timestamp = None
+        self._stop_event = threading.Event()
+        self._frame_lock = threading.Lock()
+
+        # Setup pipeline
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+
+        # Configure streams
+        if self.enable_rgb:
+            self.config.enable_stream(
+                rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps
+            )
+        if self.enable_depth:
+            self.config.enable_stream(
+                rs.stream.depth, self.width, self.height, rs.format.z16, self.fps
+            )
+
+        # Start pipeline
+        self.profile = self.pipeline.start(self.config)
+
+        # Get camera intrinsics for potential later use
+        self.color_intrinsics = None
+        self.depth_intrinsics = None
+
+        if self.enable_rgb:
+            color_profile = self.profile.get_stream(rs.stream.color)
+            self.color_intrinsics = color_profile.as_video_stream_profile().get_intrinsics()
+
+        if self.enable_depth:
+            depth_profile = self.profile.get_stream(rs.stream.depth)
+            self.depth_intrinsics = depth_profile.as_video_stream_profile().get_intrinsics()
+
+        # Align depth frames to RGB for consistency
+        self.align = rs.align(rs.stream.color)
+
+        # Start capture thread
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def _capture_loop(self):
+        """Background thread for continuous frame capture."""
+        while not self._stop_event.is_set():
+            try:
+                frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+
+                # Align depth to color frame
+                aligned_frames = self.align.process(frames)
+
+                frame_data = {}
+
+                if self.enable_rgb:
+                    color_frame = aligned_frames.get_color_frame()
+                    if color_frame:
+                        frame_data["rgb"] = np.asanyarray(color_frame.get_data())
+
+                if self.enable_depth:
+                    depth_frame = aligned_frames.get_depth_frame()
+                    if depth_frame:
+                        depth_data = np.asanyarray(depth_frame.get_data())
+                        frame_data["depth"] = depth_data
+
+                # Get timestamp from frame
+                if frames:
+                    timestamp = frames.get_timestamp()
+                    frame_data["timestamp"] = timestamp / 1000.0  # Convert ms to seconds
+
+                # Update with lock
+                with self._frame_lock:
+                    self._latest_frame = frame_data
+                    self._latest_timestamp = time.perf_counter()
+
+            except Exception as e:
+                print(f"[RealSense] Capture error: {e}")
+                time.sleep(0.01)
+
+    @property
+    def latest_frame(self):
+        """Get latest captured frame data safely."""
+        with self._frame_lock:
+            return self._latest_frame.copy() if self._latest_frame else None
+
+    @property
+    def latest_timestamp(self):
+        """Get timestamp of latest frame capture."""
+        with self._frame_lock:
+            return self._latest_timestamp
+
+    def close(self):
+        """Stop capture and close pipeline."""
+        self._stop_event.set()
+        try:
+            self._thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self.pipeline.stop()
+        except Exception:
+            pass
 
 
 class TeleopHDF5Logger:
@@ -75,6 +208,12 @@ class TeleopHDF5Logger:
         self.file.attrs["hand_current_limit"] = args.hand_current_limit
         self.file.attrs["script"] = "combined_simple_teleop_real_logger.py"
 
+        # Camera configuration
+        self.has_camera = args.enable_realsense
+        self.camera_width = args.realsense_width
+        self.camera_height = args.realsense_height
+        self.camera_fps = args.realsense_fps
+
         self.datasets = {
             "time/monotonic_s": self._create_dataset("time/monotonic_s", (0,), (None,), np.float64),
             "time/wall_time_s": self._create_dataset("time/wall_time_s", (0,), (None,), np.float64),
@@ -88,6 +227,46 @@ class TeleopHDF5Logger:
             "hand/leap_pose": self._create_dataset("hand/leap_pose", (0, 16), (None, 16), np.float64),
             "hand/has_glove_data": self._create_dataset("hand/has_glove_data", (0,), (None,), np.bool_),
         }
+
+        # Camera datasets - created only if camera is enabled
+        if self.has_camera:
+            # Store RGB frames as variable-length uint8 arrays (flattened for HDF5 storage)
+            vlen_uint8 = h5py.special_dtype(vlen=np.uint8)
+            self.datasets["camera/rgb"] = self._create_dataset(
+                "camera/rgb",
+                (0,),
+                (None,),
+                vlen_uint8,
+            )
+            # Store depth frames as variable-length uint16 arrays (flattened for HDF5 storage)
+            vlen_uint16 = h5py.special_dtype(vlen=np.uint16)
+            self.datasets["camera/depth"] = self._create_dataset(
+                "camera/depth",
+                (0,),
+                (None,),
+                vlen_uint16,
+            )
+            # Store camera frame timestamps for frame-accurate synchronization
+            self.datasets["camera/frame_time"] = self._create_dataset(
+                "camera/frame_time",
+                (0,),
+                (None,),
+                np.float64,
+            )
+            # Store camera frame indices to track drops
+            self.datasets["camera/frame_index"] = self._create_dataset(
+                "camera/frame_index",
+                (0,),
+                (None,),
+                np.int64,
+            )
+            # Store camera file attributes for reconstruction
+            self.file.attrs["camera_width"] = self.camera_width
+            self.file.attrs["camera_height"] = self.camera_height
+            self.file.attrs["camera_fps"] = self.camera_fps
+            self.file.attrs["camera_enabled"] = True
+        else:
+            self.file.attrs["camera_enabled"] = False
 
     def _create_dataset(self, name, shape, maxshape, dtype):
         return self.file.create_dataset(
@@ -110,6 +289,9 @@ class TeleopHDF5Logger:
         canfd_status,
         glove_message,
         leap_pose,
+        camera_frame=None,
+        camera_frame_time=None,
+        camera_frame_index=None,
     ):
         index = self.sample_count
 
@@ -140,6 +322,30 @@ class TeleopHDF5Logger:
             ),
             "hand/has_glove_data": bool(glove_message is not None),
         }
+
+        # Add camera data if enabled
+        if self.has_camera and camera_frame is not None:
+            rgb_frame = camera_frame.get("rgb")
+            depth_frame = camera_frame.get("depth")
+            frame_timestamp = camera_frame.get("timestamp", 0.0)
+
+            # Store RGB frame as flattened uint8 array
+            if rgb_frame is not None:
+                rgb_flat = np.asarray(rgb_frame, dtype=np.uint8).flatten()
+                values["camera/rgb"] = rgb_flat
+            else:
+                values["camera/rgb"] = np.array([], dtype=np.uint8)
+
+            # Store depth frame as flattened uint16 array
+            if depth_frame is not None:
+                depth_flat = np.asarray(depth_frame, dtype=np.uint16).flatten()
+                values["camera/depth"] = depth_flat
+            else:
+                values["camera/depth"] = np.array([], dtype=np.uint16)
+
+            # Store frame metadata
+            values["camera/frame_time"] = float(camera_frame_time or frame_timestamp)
+            values["camera/frame_index"] = int(camera_frame_index or -1)
 
         for name, value in values.items():
             dataset = self.datasets[name]
@@ -346,10 +552,12 @@ class CombinedSimpleTeleop:
         self.mapper = None
         self.hand = None
         self.glove = None
+        self.camera = None
         self.logger = None
         self.interpolator = HighFrequencyInterpolator()
         self._last_cmd_pose = None
         self._last_recovery_t = 0.0
+        self._camera_frame_index = 0
 
     @staticmethod
     def _wrap_angle(angle):
@@ -495,6 +703,23 @@ class CombinedSimpleTeleop:
             self.logger = TeleopHDF5Logger(log_path, self.args)
             print(f"HDF5 logging enabled: {log_path}")
 
+        # Initialize RealSense camera if enabled
+        if self.args.enable_realsense:
+            try:
+                self.camera = RealSenseD435iCapture(
+                    width=self.args.realsense_width,
+                    height=self.args.realsense_height,
+                    fps=self.args.realsense_fps,
+                    enable_rgb=self.args.realsense_rgb,
+                    enable_depth=self.args.realsense_depth,
+                )
+                print(
+                    f"RealSense D435i initialized: {self.args.realsense_width}x{self.args.realsense_height} @ {self.args.realsense_fps} Hz"
+                )
+            except Exception as e:
+                print(f"[WARNING] Failed to initialize RealSense camera: {e}")
+                self.camera = None
+
         initial_pose = self.mapper.get_current_robot_pose()
         if initial_pose:
             time.sleep(1)
@@ -586,6 +811,17 @@ class CombinedSimpleTeleop:
                 print("\nWaiting for MANUS ergonomics data on ZMQ...")
                 warned_no_glove = True
 
+            # Capture camera frame if available
+            camera_frame = None
+            camera_frame_time = None
+            camera_frame_index = None
+            if self.camera is not None:
+                camera_frame = self.camera.latest_frame
+                if camera_frame is not None:
+                    camera_frame_time = camera_frame.get("timestamp", wall_time_s)
+                    camera_frame_index = self._camera_frame_index
+                    self._camera_frame_index += 1
+
             if self.logger is not None:
                 self.logger.append_sample(
                     monotonic_s=loop_start,
@@ -598,6 +834,9 @@ class CombinedSimpleTeleop:
                     canfd_status=arm_ret,
                     glove_message=glove_message,
                     leap_pose=leap_pose,
+                    camera_frame=camera_frame,
+                    camera_frame_time=camera_frame_time,
+                    camera_frame_index=camera_frame_index,
                 )
 
             if not arm_ok:
@@ -628,6 +867,8 @@ class CombinedSimpleTeleop:
     def shutdown(self):
         if self.logger is not None:
             self.logger.close()
+        if self.camera is not None:
+            self.camera.close()
         if self.glove is not None:
             self.glove.close()
         if self.mapper is not None:
@@ -640,7 +881,7 @@ class CombinedSimpleTeleop:
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Simple combined teleop: Vive tracker arm + MANUS direct-copy LEAP Hand"
+        description="Simple combined teleop: Vive tracker arm + MANUS direct-copy LEAP Hand + RealSense D435i camera"
     )
     parser.add_argument("--robot-ip", default="192.168.1.18")
     parser.add_argument("--robot-port", type=int, default=8080)
@@ -663,6 +904,41 @@ def build_parser():
     )
     parser.add_argument("--log-path", default=None)
     parser.add_argument("--log-flush-every", type=int, default=50)
+
+    # RealSense camera arguments
+    parser.add_argument(
+        "--enable-realsense", action="store_true", default=False,
+        help="Enable Intel RealSense D435i depth camera integration.",
+    )
+    parser.add_argument(
+        "--realsense-width", type=int, default=640,
+        help="RealSense camera frame width in pixels.",
+    )
+    parser.add_argument(
+        "--realsense-height", type=int, default=480,
+        help="RealSense camera frame height in pixels.",
+    )
+    parser.add_argument(
+        "--realsense-fps", type=int, default=30,
+        help="RealSense camera FPS (frames per second).",
+    )
+    parser.add_argument(
+        "--realsense-rgb", action="store_true", default=True,
+        help="Capture RGB frames from RealSense (on by default).",
+    )
+    parser.add_argument(
+        "--no-realsense-rgb", dest="realsense_rgb", action="store_false",
+        help="Disable RGB frame capture.",
+    )
+    parser.add_argument(
+        "--realsense-depth", action="store_true", default=True,
+        help="Capture depth frames from RealSense (on by default).",
+    )
+    parser.add_argument(
+        "--no-realsense-depth", dest="realsense_depth", action="store_false",
+        help="Disable depth frame capture.",
+    )
+
     return parser
 
 
