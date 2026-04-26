@@ -8,49 +8,20 @@ The script performs two phases:
     1. Move to fixed teleop start joints [0, 25, 90, 0, 60, 0]
     2. Replay: execute the full recorded trajectory at the original speed
 
-The script feeds arm/smoothed_pose (already safety-filtered during recording)
-and hand/leap_pose into the controller, which still runs them through all the
-same safety bounds before sending to hardware — so double protection is in place.
-
-For smooth replay of pre-recorded trajectories, use:
-  --trajectory-mode 2  (filter mode for maximum smoothing, vs. 1 for curve-fitting)
-  --trajectory-radio 500-800  (smoothing coefficient; higher = smoother)
-
 Usage
 -----
     # Real-time replay with smooth filter mode (default)
     python replay_hdf5.py Combined/logs/teleop_20240101_120000.hdf5
 
-    # Half-speed replay, no hand
-    python replay_hdf5.py recording.hdf5 --speed 0.5 --no-hand
-
-    # Maximum smoothing (mode 2, radio 800)
-    python replay_hdf5.py recording.hdf5 --trajectory-mode 2 --trajectory-radio 800
-
-    # Responsive curve-fitting mode (for comparison to live teleop)
-    python replay_hdf5.py recording.hdf5 --trajectory-mode 1 --trajectory-radio 50
-
-    # Inspect a file without touching hardware
-    python replay_hdf5.py recording.hdf5 --dry-run
-
-    # Override robot IP
-    python replay_hdf5.py recording.hdf5 --robot-ip 192.168.1.18
+    # Replay AND show the recorded RealSense video feed in sync
+    python replay_hdf5.py recording.hdf5 --show-video
 """
 
 import argparse
 import os
 import sys
 import time
-
 import numpy as np
-
-# ---------------------------------------------------------------------------
-# Make sure robot_pose_controller is importable when this script is run from
-# outside the Combined/ directory.
-# ---------------------------------------------------------------------------
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
 
 try:
     import h5py
@@ -58,11 +29,19 @@ except ImportError:
     print("ERROR: h5py is not installed. Run:  pip install h5py")
     sys.exit(1)
 
+# Optional OpenCV for video playback
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
 from robot_pose_controller import RobotPoseController  # noqa: E402
 
-
 START_JOINT_DEG = [0.0, 25.0, 90.0, 0.0, 60.0, 0.0]
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,18 +49,27 @@ START_JOINT_DEG = [0.0, 25.0, 90.0, 0.0, 60.0, 0.0]
 
 def _load_recording(hdf5_path: str):
     """Load all replay-relevant arrays from an HDF5 file."""
-    with h5py.File(hdf5_path, "r") as f:
-        arm_poses   = f["arm/smoothed_pose"][:]     # (N, 6)  float64
-        hand_poses  = f["hand/leap_pose"][:]         # (N, 16) float64
-        has_glove   = f["hand/has_glove_data"][:]    # (N,)    bool
-        timestamps  = f["time/monotonic_s"][:]       # (N,)    float64
+    f = h5py.File(hdf5_path, "r")
+    
+    arm_poses   = f["arm/smoothed_pose"][:]     # (N, 6)  float64
+    hand_poses  = f["hand/leap_pose"][:]         # (N, 16) float64
+    timestamps  = f["time/monotonic_s"][:]       # (N,)    float64
 
-        meta = {k: f.attrs[k] for k in f.attrs}
+    # Backwards compatibility: Check for explicit glove boolean, otherwise infer from NaNs
+    if "hand/has_glove_data" in f:
+        has_glove = f["hand/has_glove_data"][:]
+    else:
+        has_glove = ~np.isnan(hand_poses[:, 0])
 
-    return arm_poses, hand_poses, has_glove, timestamps, meta
+    meta = {k: f.attrs[k] for k in f.attrs}
+    
+    # Do not load camera data into RAM (it's too large). Just check if it exists.
+    has_camera = "camera/color" in f
+
+    return arm_poses, hand_poses, has_glove, timestamps, meta, has_camera, f
 
 
-def _print_metadata(meta: dict, n_samples: int, timestamps: np.ndarray):
+def _print_metadata(meta: dict, n_samples: int, timestamps: np.ndarray, has_camera: bool):
     print("\n--- Recording metadata ---")
     for k in ["created_utc", "robot_ip", "control_hz", "hand_side", "script", "zmq_endpoint"]:
         if k in meta:
@@ -89,18 +77,37 @@ def _print_metadata(meta: dict, n_samples: int, timestamps: np.ndarray):
     duration = float(timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0.0
     print(f"  {'samples':20s}: {n_samples}")
     print(f"  {'duration_s':20s}: {duration:.3f}")
+    print(f"  {'contains_video':20s}: {has_camera}")
     print("--------------------------\n")
 
 
 def _move_robot_to_start_joints(ctrl: RobotPoseController):
-    """Move to the same deterministic start joint pose used by live teleoperation."""
     target_joints = list(START_JOINT_DEG)
     robot = ctrl.robot
 
-    print(
-        "\n--- Phase 0: Move to teleop start joints ---\n"
-        "Target joints (deg): " + " ".join(f"{v:.1f}" for v in target_joints)
-    )
+    print("\n--- Phase 0: Move to teleop start joints ---")
+    
+    # 1. Get current joints BEFORE moving to bypass API caching bugs
+    res, curr_joints = robot.rm_get_joint_degree()
+    sleep_time = 3.0  # Minimum default wait
+    
+    if res == 0 and curr_joints:
+        max_dist = max(abs(curr_joints[i] - target_joints[i]) for i in range(6))
+        
+        if max_dist < 1.0:
+            print("Arm is already at start joints. Proceeding.")
+            time.sleep(0.5)
+            return
+            
+        # Time = Distance / Speed (20 deg/s) + 1.5s buffer for acceleration/deceleration
+        sleep_time = (max_dist / 20.0) + 1.5
+        print(f"Arm needs to move {max_dist:.1f} degrees.")
+        print(f"Calculating travel time: {sleep_time:.1f} seconds...")
+    else:
+        print("[WARNING] Could not read current joints. Using conservative 10s travel wait.")
+        sleep_time = 10.0
+
+    print("Target joints (deg): " + " ".join(f"{v:.1f}" for v in target_joints))
 
     move_attempts = [
         ("rm_movej", (target_joints, 20, 0, 0, 1)),
@@ -119,20 +126,21 @@ def _move_robot_to_start_joints(ctrl: RobotPoseController):
         try:
             ret = method(*args)
             if ret == 0:
-                time.sleep(0.5)
+                print(f"Command accepted. Blocking for {sleep_time:.1f}s while physical arm moves...")
+                
+                # --- The foolproof blocking wait ---
+                time.sleep(sleep_time)
+                
                 print("Reached teleop start joints.")
                 return
+                
             last_exc = RuntimeError(f"{method_name} returned {ret}")
         except TypeError:
             continue
         except Exception as exc:
             last_exc = exc
 
-    raise RuntimeError(
-        f"Failed to move to teleop start joints {target_joints}. Last error: {last_exc}"
-    )
-
-
+    raise RuntimeError(f"Failed to move to teleop start joints {target_joints}. Last error: {last_exc}")
 # ---------------------------------------------------------------------------
 # Core replay loop
 # ---------------------------------------------------------------------------
@@ -146,35 +154,38 @@ def replay(
     connect_hand: bool,
     dry_run: bool,
     start_delay: float,
-    trajectory_mode: int = 2,
-    trajectory_radio: int = 500,
+    trajectory_mode: int,
+    trajectory_radio: int,
+    show_video: bool,
 ):
     if not os.path.isfile(hdf5_path):
         print(f"ERROR: File not found: {hdf5_path}")
         sys.exit(1)
 
     print(f"Loading {hdf5_path} ...")
-    arm_poses, hand_poses, has_glove, timestamps, meta = _load_recording(hdf5_path)
+    arm_poses, hand_poses, has_glove, timestamps, meta, has_camera, h5_file = _load_recording(hdf5_path)
     n = arm_poses.shape[0]
-    _print_metadata(meta, n, timestamps)
+    _print_metadata(meta, n, timestamps, has_camera)
 
-    # ------------------------------------------------------------------
-    # Dry-run: just inspect and exit
-    # ------------------------------------------------------------------
+    if show_video and not has_camera:
+        print("[WARNING] --show-video requested, but this HDF5 file does not contain camera data.")
+        show_video = False
+    elif show_video and cv2 is None:
+        print("[WARNING] --show-video requested, but opencv-python is not installed.")
+        show_video = False
+
+    # Dry-run
     if dry_run:
         print("[DRY RUN] No hardware connection made.\n")
         duration = float(timestamps[-1] - timestamps[0]) if n > 1 else 0.0
         print(f"  Samples            : {n}")
         print(f"  Recording duration : {duration:.3f} s  ({duration / speed:.3f} s at {speed}x)")
-        print(f"  First arm pose     : {arm_poses[0].tolist()}")
-        print(f"  Last  arm pose     : {arm_poses[-1].tolist()}")
         glove_count = int(np.sum(has_glove))
         print(f"  Samples with glove : {glove_count} / {n}")
+        h5_file.close()
         return
 
-    # ------------------------------------------------------------------
-    # Connect to hardware
-    # ------------------------------------------------------------------
+    # Connect hardware
     print("\nConnecting to robot hardware...")
     ctrl = RobotPoseController(
         robot_ip=robot_ip,
@@ -182,39 +193,24 @@ def replay(
         hand_port=hand_port,
         connect_hand=connect_hand,
     )
-    print(f"Replay settings: trajectory_mode={trajectory_mode}, trajectory_radio={trajectory_radio}")
-
-    # ------------------------------------------------------------------
-    # Phase 0: Move to deterministic teleop start joints
-    # ------------------------------------------------------------------
+    
     _move_robot_to_start_joints(ctrl)
 
-    # Seed safety filter with the first replay pose to avoid huge jump clamps
-    first_valid_pose = None
+    # Seed safety filter
     for i in range(n):
         if not np.any(np.isnan(arm_poses[i])):
-            first_valid_pose = arm_poses[i].tolist()
+            ctrl.safety.seed(arm_poses[i].tolist())
             break
 
-    if first_valid_pose:
-        ctrl.safety.seed(first_valid_pose)
-        print(f"Safety filter re-seeded with first replay pose: {[f'{v:.4f}' for v in first_valid_pose]}")
-
-    # ------------------------------------------------------------------
-    # Phase 1: Countdown before replay
-    # ------------------------------------------------------------------
+    # Countdown
     print(f"\n--- Phase 1: Replay ({n} samples) ---")
-    print(f"Starting replay in {start_delay:.0f} seconds — press Ctrl+C to abort.")
     deadline = time.perf_counter() + start_delay
     while time.perf_counter() < deadline:
-        remaining = deadline - time.perf_counter()
-        print(f"\r  {remaining:.1f}s ... ", end="", flush=True)
+        print(f"\r  {deadline - time.perf_counter():.1f}s ... ", end="", flush=True)
         time.sleep(0.1)
     print("\r  Go!                ")
 
-    # ------------------------------------------------------------------
     # Replay loop
-    # ------------------------------------------------------------------
     replay_wall_start = time.perf_counter()
     try:
         for i in range(n):
@@ -223,46 +219,35 @@ def replay(
             arm_pose = arm_poses[i]
             hand_pose = hand_poses[i] if has_glove[i] else None
 
-            # Skip frames with NaN arm data (can occur at logger startup)
             if np.any(np.isnan(arm_pose)):
-                if i < 5:  # Only warn on first few
-                    print(f"  (skipping sample {i}: arm pose is NaN)")
                 continue
 
-            # Sanity check: if first sample is all zeros, warn
-            if i == 0 and np.allclose(arm_pose, 0):
-                print(f"\n[WARNING] First arm pose is all zeros. Recording may be corrupted.")
-                print(f"  Pose: {arm_pose.tolist()}")
-                print(f"  Continuing anyway...\n")
-
-            # --- Send arm with smooth trajectory parameters for replay ---
+            # Command Arm
             ret = ctrl.send_arm_pose(arm_pose.tolist(), trajectory_mode, trajectory_radio)
             if ret != 0:
                 print(f"\n[ERROR] CANFD status {ret} at sample {i}. Arm may not be connected.")
-                print(f"  Pose sent: {arm_pose.tolist()}")
-                print(f"  Trajectory mode: {trajectory_mode}, radio: {trajectory_radio}")
                 break
 
-            # --- Send hand (only when glove data was active during recording) ---
+            # Command Hand
             if hand_pose is not None and not np.any(np.isnan(hand_pose)):
                 ctrl.send_hand_pose(hand_pose.tolist())
 
-            # --- Progress display ---
-            pct = (i + 1) / n * 100.0
-            arm_str = " ".join(f"{v:7.4f}" for v in arm_pose)
-            hand_str = "hand:on " if (hand_pose is not None) else "hand:off"
-            print(
-                f"\r[{pct:5.1f}%] {i + 1:6d}/{n}  arm: {arm_str}  {hand_str}  ",
-                end="",
-                flush=True,
-            )
+            # Optional: Display Video (skipping frames to maintain 125Hz performance)
+            if show_video and i % 4 == 0: 
+                frame = h5_file["camera/color"][i]
+                cv2.imshow("Replay Camera (Recorded)", frame)
+                cv2.waitKey(1)
 
-            # --- Timing: maintain original inter-frame cadence scaled by speed ---
+            # Terminal output
+            if i % 10 == 0:
+                pct = (i + 1) / n * 100.0
+                arm_str = " ".join(f"{v:7.4f}" for v in arm_pose)
+                hand_str = "hand:on " if (hand_pose is not None) else "hand:off"
+                print(f"\r[{pct:5.1f}%] {i + 1:6d}/{n}  arm: {arm_str}  {hand_str}  ", end="", flush=True)
+
+            # Timing Cadence
             if i + 1 < n:
-                original_dt = float(timestamps[i + 1] - timestamps[i])
-                target_dt = original_dt / max(speed, 1e-6)
-                target_t = loop_t + target_dt
-                # Precision spin-wait (same approach as the teleop scripts)
+                target_t = loop_t + (float(timestamps[i + 1] - timestamps[i]) / max(speed, 1e-6))
                 while time.perf_counter() < target_t:
                     pass
 
@@ -273,48 +258,25 @@ def replay(
         print("\nReplay stopped by user.")
 
     finally:
+        h5_file.close()
+        if show_video:
+            cv2.destroyAllWindows()
         ctrl.shutdown()
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def _build_parser():
-    p = argparse.ArgumentParser(
-        description="Replay a teleoperation HDF5 recording on the real robot.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument(
-        "hdf5_path",
-        help="Path to the HDF5 file produced by combined_simple_teleop_real_logger.py.",
-    )
-    p.add_argument("--robot-ip", default="192.168.1.18", help="RealMan arm IP address.")
-    p.add_argument("--robot-port", type=int, default=8080, help="RealMan arm TCP port.")
-    p.add_argument("--hand-port", default=None, help="Serial port for LEAP hand (auto-detected if omitted).")
-    p.add_argument(
-        "--speed", type=float, default=1.0,
-        help="Playback speed multiplier. 1.0 = real-time, 0.5 = half-speed, 2.0 = double-speed.",
-    )
-    p.add_argument("--no-hand", action="store_true", help="Skip LEAP hand replay.")
-    p.add_argument(
-        "--dry-run", action="store_true",
-        help="Inspect the HDF5 file and print a summary without connecting to hardware.",
-    )
-    p.add_argument(
-        "--start-delay", type=float, default=3.0,
-        help="Seconds to wait (with countdown) before motion begins.",
-    )
-    p.add_argument(
-        "--trajectory-mode", type=int, default=2,
-        help="RealMan arm trajectory mode: 0=passthrough, 1=curve-fitting, 2=filter (best for replay).",
-    )
-    p.add_argument(
-        "--trajectory-radio", type=int, default=500,
-        help="Trajectory smoothing coefficient (mode 1: 0-100, mode 2: 0-999).",
-    )
+    p = argparse.ArgumentParser(description="Replay a teleoperation HDF5 recording on the real robot.")
+    p.add_argument("hdf5_path", help="Path to the HDF5 file.")
+    p.add_argument("--robot-ip", default="192.168.1.18")
+    p.add_argument("--robot-port", type=int, default=8080)
+    p.add_argument("--hand-port", default=None)
+    p.add_argument("--speed", type=float, default=1.0)
+    p.add_argument("--no-hand", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--start-delay", type=float, default=3.0)
+    p.add_argument("--trajectory-mode", type=int, default=2)
+    p.add_argument("--trajectory-radio", type=int, default=500)
+    p.add_argument("--show-video", action="store_true", help="Playback the recorded camera view concurrently.")
     return p
-
 
 def main():
     args = _build_parser().parse_args()
@@ -329,8 +291,8 @@ def main():
         start_delay=args.start_delay,
         trajectory_mode=args.trajectory_mode,
         trajectory_radio=args.trajectory_radio,
+        show_video=args.show_video,
     )
-
 
 if __name__ == "__main__":
     main()
