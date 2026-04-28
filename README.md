@@ -20,6 +20,7 @@ python replay_hdf5.py logs/teleop_YYYYMMDD_HHMMSS.hdf5
 
 ## Documentation
 
+- **[INSTALLATION_AND_RUN.md](INSTALLATION_AND_RUN.md)** — Canonical lab setup guide for the MANUS SDK and combined teleop logger
 - **[SETUP_AND_EXECUTION.md](SETUP_AND_EXECUTION.md)** — Complete setup guide, installation, and all command options
 - **[DATA_PIPELINE.md](DATA_PIPELINE.md)** — Detailed explanation of data flow, processing stages, and file formats
 

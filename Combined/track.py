@@ -4,10 +4,14 @@ import os
 import openvr
 import math
 import json
-from IPython import embed 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
+
+try:
+    from IPython import embed
+except ImportError:
+    embed = None
 
 
 def eye_T():
@@ -15,7 +19,13 @@ def eye_T():
 
 class ViveTrackerModule():
     def __init__(self, configfile_path=None):
-        self.vr = openvr.init(openvr.VRApplication_Other)
+        try:
+            self.vr = openvr.init(openvr.VRApplication_Other)
+        except Exception as exc:
+            raise RuntimeError(
+                "OpenVR failed to initialize. Start SteamVR first, and run Python under the same "
+                f"home directory that owns the SteamVR install. Current HOME is {os.path.expanduser('~')!r}."
+            ) from exc
         self.vrsystem = openvr.VRSystem()
         self.object_names = {"Tracking Reference":[],"HMD":[],"Controller":[],"Tracker":[]}
         self.devices = {}
