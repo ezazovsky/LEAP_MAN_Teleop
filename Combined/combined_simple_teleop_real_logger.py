@@ -180,6 +180,7 @@ class HDF5LoggingProcess(mp.Process):
         
         datasets = {
             "time/monotonic_s": file.create_dataset("time/monotonic_s", (0,), maxshape=(None,), dtype=np.float64, chunks=True),
+            "arm/raw_pose": file.create_dataset("arm/raw_pose", (0, 6), maxshape=(None, 6), dtype=np.float64, chunks=True),
             "arm/safe_pose": file.create_dataset("arm/safe_pose", (0, 6), maxshape=(None, 6), dtype=np.float64, chunks=True),
             "arm/smoothed_pose": file.create_dataset("arm/smoothed_pose", (0, 6), maxshape=(None, 6), dtype=np.float64, chunks=True),
             "hand/manus_joints": file.create_dataset("hand/manus_joints", (0, 20), maxshape=(None, 20), dtype=np.float64, chunks=True),
@@ -499,6 +500,7 @@ class CombinedSimpleTeleop:
                     "camera_ts": self.cam_ts_val.value,
                     "arrays": {
                         "time/monotonic_s": np.float64(loop_start),
+                        "arm/raw_pose": np.asarray(raw_pose, dtype=np.float64),
                         "arm/safe_pose": np.asarray(safe_pose, dtype=np.float64),
                         "arm/smoothed_pose": np.asarray(smoothed_pose, dtype=np.float64),
                         "hand/manus_joints": np.asarray(glove_message if glove_message else [np.nan]*20, dtype=np.float64),

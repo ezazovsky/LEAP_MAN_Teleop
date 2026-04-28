@@ -7,7 +7,7 @@ Complete walkthrough of how data flows through the bimanual teleoperation system
 ## Overview: Two Pipelines
 
 ### Pipeline 1: Live Teleoperation + Logging (combined_simple_teleop_real_logger.py)
-Real-time control with HDF5 recording of all intermediate processing stages.
+Real-time control with HDF5 recording of arm, hand, and synchronized RGB camera data.
 
 ### Pipeline 2: Replay from Recording (replay_hdf5.py)
 Read HDF5 → Smooth homing → Replay trajectory at original timing.
@@ -69,7 +69,7 @@ target_pose[3:] += euler_delta
 - **Values:** `[x, y, z, rx, ry, rz]`
 - **Units:** meters, radians
 - **Data type:** float64
-- **Logged:** `arm/raw_pose` in HDF5
+- **Logged:** not written to HDF5 in the current logger; used internally to derive `arm/safe_pose`
 
 **Example:**
 ```
@@ -165,7 +165,7 @@ for i in [3, 4, 5]:
 **Output:** `bounded_pose`
 - **Format:** Python list, length 6
 - **Units:** meters, radians
-- **Logged:** `arm/bounded_pose` in HDF5
+- **Logged:** not written to HDF5 in the current logger; used internally before `arm/safe_pose`
 
 **Example (after clamping):**
 ```
@@ -193,7 +193,7 @@ else:
 - **Format:** Python list, length 6
 - **Values:** Either bounded_pose OR last_filtered_pose (hold command)
 - **Logged:** `arm/safe_pose` in HDF5
-- **Also logged:** `arm/hold_flag` (bool) — True if holding, False if moving
+- **Also used internally:** hold/no-hold state is not written as a separate HDF5 field in the current logger
 
 ---
 
@@ -393,21 +393,19 @@ self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
 self.file = h5py.File(output_path, "w")
 
 datasets = {
-    "time/monotonic_s":      (N,)    float64  - perf_counter() at loop start
-    "time/wall_time_s":      (N,)    float64  - time.time() (UNIX timestamp)
-    "arm/raw_pose":          (N, 6)  float64  - unfiltered tracker delta
-    "arm/bounded_pose":      (N, 6)  float64  - after safety bounds
-    "arm/safe_pose":         (N, 6)  float64  - pose chosen for motion
-    "arm/smoothed_pose":     (N, 6)  float64  - after EMA smoothing → SENT TO ROBOT
-    "arm/hold_flag":         (N,)    bool     - is motion clamped/holding?
-    "arm/canfd_status":      (N,)    int32    - return code from rm_movep_canfd
-    "hand/manus_joints":     (N, 20) float64  - raw glove ergonomics
-    "hand/leap_pose":        (N, 16) float64  - converted & clipped LEAP angles
-    "hand/has_glove_data":   (N,)    bool     - was glove active this frame?
+    "time/monotonic_s":      (N,)            float64  - perf_counter() at loop start
+    "arm/raw_pose":          (N, 6)          float64  - unfiltered tracker delta (for learning/analysis)
+    "arm/safe_pose":         (N, 6)          float64  - pose after safety bounds / hold fallback
+    "arm/smoothed_pose":     (N, 6)          float64  - after EMA smoothing -> sent to robot
+    "hand/manus_joints":     (N, 20)         float64  - raw glove ergonomics, or NaNs if absent
+    "hand/leap_pose":        (N, 16)         float64  - converted LEAP command, or NaNs if absent
+    "camera/timestamp_ns":   (N,)            uint64   - RealSense frame timestamp captured by camera process
+    "camera/color":          (N, H, W, 3)    uint8    - BGR video frames (when --enable-camera is used)
 }
 
-# All use chunks=True for streaming writes
-# All use maxshape=(None, ...) for unbounded growth
+# All datasets use chunks=True for streaming writes.
+# All datasets use maxshape=(None, ...) for unbounded growth.
+# camera/color dataset uses LZF compression to reduce file size.
 ```
 
 **Sample Append:**
@@ -434,17 +432,7 @@ if sample_count % flush_every == 0:
 ```python
 file.attrs["created_utc"]          = "2026-04-19T21:22:17.010276Z"
 file.attrs["robot_ip"]             = "192.168.1.18"
-file.attrs["robot_port"]           = 8080
-file.attrs["zmq_endpoint"]         = "tcp://localhost:8000"
-file.attrs["hand_side"]            = "right"
 file.attrs["control_hz"]           = 125.0
-file.attrs["arm_pos_scale"]        = 1.0
-file.attrs["arm_rot_scale"]        = 1.0
-file.attrs["hand_current_limit"]   = 350  # mA
-file.attrs["script"]               = "combined_simple_teleop_real_logger.py"
-file.attrs["tracker_key"]          = "Device Serial Number"
-file.attrs["robot_home_pose"]      = [x, y, z, rx, ry, rz]  # shape (6,)
-file.attrs["tracker_home_T"]       = [[...], [...], [...], [...]]  # shape (4, 4)
 file.attrs["sample_count"]         = 1584  # written on close()
 ```
 
@@ -453,19 +441,17 @@ file.attrs["sample_count"]         = 1584  # written on close()
 ```
 teleop_20260419_162217.hdf5
 ├── time/
-│   ├── monotonic_s          (1584,)      perf timestamps
-│   └── wall_time_s          (1584,)      UNIX timestamps
+│   └── monotonic_s          (1584,)      perf timestamps
 ├── arm/
-│   ├── raw_pose             (1584, 6)    unfiltered tracker
-│   ├── bounded_pose         (1584, 6)    after safety bounds
+│   ├── raw_pose             (1584, 6)    unfiltered tracker (for learning)
 │   ├── safe_pose            (1584, 6)    final choice (move or hold)
-│   ├── smoothed_pose        (1584, 6)    after EMA → sent to hardware
-│   ├── hold_flag            (1584,)      bool: is holding?
-│   └── canfd_status         (1584,)      int32: command return code
+│   └── smoothed_pose        (1584, 6)    after EMA -> sent to hardware
 ├── hand/
-│   ├── manus_joints         (1584, 20)   raw glove data
-│   ├── leap_pose            (1584, 16)   converted & clipped angles
-│   └── has_glove_data       (1584,)      bool: glove active?
+│   ├── manus_joints         (1584, 20)   raw glove data or NaNs
+│   └── leap_pose            (1584, 16)   converted LEAP command or NaNs
+├── camera/
+│   ├── timestamp_ns         (1584,)      camera frame timestamps
+│   └── color                (1584,H,W,3) BGR video frames when enabled
 └── [attributes]              (metadata)
 ```
 
@@ -481,17 +467,21 @@ teleop_20260419_162217.hdf5
 with h5py.File(hdf5_path, "r") as f:
     arm_poses   = f["arm/smoothed_pose"][:]     # Load entire array into memory
     hand_poses  = f["hand/leap_pose"][:]
-    has_glove   = f["hand/has_glove_data"][:]
     timestamps  = f["time/monotonic_s"][:]      # For timing
     meta        = dict(f.attrs)                 # Metadata dict
+    has_glove   = ~np.isnan(hand_poses[:, 0])
+    has_camera  = "camera/color" in f
 ```
 
 **Data in memory:**
-- `arm_poses`: numpy array, shape `(1584, 6)`, dtype float64
+- `arm_poses`: numpy array, shape `(1584, 6)`, dtype float64 (loaded from `arm/smoothed_pose`)
 - `hand_poses`: numpy array, shape `(1584, 16)`, dtype float64
-- `has_glove`: numpy array, shape `(1584,)`, dtype bool
+- `has_glove`: numpy array, shape `(1584,)`, dtype bool inferred from `hand/leap_pose`
 - `timestamps`: numpy array, shape `(1584,)`, dtype float64
 - `meta`: dict with creator, robot IP, control Hz, etc.
+- `has_camera`: bool indicating whether `camera/color` is present in the file
+
+**Note:** The HDF5 file also contains `arm/raw_pose` (unfiltered tracker data) for potential analysis or policy learning. Replay always uses `arm/smoothed_pose` to reproduce the original smooth trajectory.
 
 ---
 
@@ -685,15 +675,15 @@ self.hand.write_desired_pos(motors, clipped_joints)
 LIVE TELEOPERATION PIPELINE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Vive Tracker                    MANUS Glove (ZMQ)
-    ↓                                  ↓
-  4×4 Transform             40-value ergonomics stream
-    ↓                                  ↓
-  Extract position          Split left/right (20 values)
-  Remap coordinates               ↓
-    ↓                        [raw_pose] → manus_joints (logged)
-  [raw_pose] (logged)            ↓
-    ↓                        Convert to LEAP frame
+Vive Tracker                    MANUS Glove (ZMQ)                RealSense Camera
+        ↓                                  ↓                                 ↓
+    4×4 Transform             40-value ergonomics stream            RGB frame + timestamp
+        ↓                                  ↓                                 ↓
+    Extract position          Split left/right (20 values)         [camera/color] +
+    Remap coordinates               ↓                               [camera/timestamp_ns]
+        ↓                        [manus_joints] (logged)
+    [raw_pose] (computed)           ↓
+        ↓                        Convert to LEAP frame
   
   ├── Safety Bounds (6 steps)    ├── Apply safety clip
   │   • Jump protection          │
@@ -702,8 +692,6 @@ Vive Tracker                    MANUS Glove (ZMQ)
   │   • Reach clamp             [send to 16 Dynamixels]
   │   • Min reach                    ↓
   │   • Boundary damping        LEAP Hand Hardware
-  │
-  ├→ [bounded_pose] (logged)
   │
   ├→ Choose move or hold
   │
@@ -721,10 +709,10 @@ Vive Tracker                    MANUS Glove (ZMQ)
 HDF5 LOGGING
 ━━━━━━━━━━━━
 All steps logged to file in parallel:
-- arm/{raw,bounded,safe,smoothed}_pose
-- arm/{hold_flag, canfd_status}
-- hand/{manus_joints, leap_pose, has_glove_data}
-- time/{monotonic_s, wall_time_s}
+- arm/{raw_pose, safe_pose, smoothed_pose}
+- hand/{manus_joints, leap_pose}
+- camera/{timestamp_ns, color} when camera logging is enabled
+- time/{monotonic_s}
 
 
 REPLAY PIPELINE
@@ -761,15 +749,13 @@ REPLAY LOOP (for each sample i in 1..N)
 | Data | Shape | Type | Range | Units |
 |------|-------|------|-------|-------|
 | `raw_pose` | (N, 6) or (6,) | float64 | any | m, rad |
-| `bounded_pose` | (N, 6) or (6,) | float64 | safe only | m, rad |
 | `safe_pose` | (N, 6) or (6,) | float64 | safe only | m, rad |
 | `smoothed_pose` | (N, 6) or (6,) | float64 | safe/smooth | m, rad |
 | `manus_joints` | (N, 20) or (20,) | float64 | ~[0, 1] | normalized |
 | `leap_pose` | (N, 16) or (16,) | float64 | [-3, 4] | rad |
-| `hold_flag` | (N,) | bool | T/F | — |
-| `has_glove_data` | (N,) | bool | T/F | — |
-| `canfd_status` | (N,) | int32 | 0, 1, -1 | status code |
-| `timestamp` | (N,) | float64 | any | seconds |
+| `camera/timestamp_ns` | (N,) | uint64 | any | ns |
+| `camera/color` | (N, H, W, 3) | uint8 | 0-255 | BGR image |
+| `time/monotonic_s` | (N,) | float64 | any | seconds |
 
 ---
 
