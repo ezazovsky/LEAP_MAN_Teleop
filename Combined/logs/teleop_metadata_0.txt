@@ -1,0 +1,29 @@
+================== Teleop Recording Metadata ==================
+Recording Date (UTC): 2026-04-28T20:18:14.767677Z
+Recording Date (Local): 2026-04-28T15:18:14.767680
+
+--- Control Parameters ---
+Control Frequency (Hz): 125.0
+Interpolation Decay (Position): 0.15
+Interpolation Decay (Rotation): 0.15
+
+--- Recording Statistics ---
+Total Runtime (seconds): 12.02
+Total Samples: 1000
+Average Frequency (Hz): 83.18
+
+--- Robot Configuration ---
+Robot IP: 192.168.1.18
+Robot Port: 8080
+Arm Position Scale: 1.0
+Arm Rotation Scale: 1.0
+
+--- Hardware Enabled ---
+Camera Enabled: True
+Hand Current Limit (mA): 350
+Hand Side: right
+
+--- File Information ---
+HDF5 Data File: teleop_data_0.hdf5
+Metadata File: teleop_metadata_0.txt
+============================================================

@@ -51,6 +51,8 @@ sudo apt-get install -y \
 
 If you are using SteamVR on the same machine, also install the tracker/runtime packages used by the teleop stack:
 
+If you need to run SteamVR without a headset attached, follow [STEAMGUIDE.md](STEAMGUIDE.md) for the null-driver setup.
+
 ```bash
 sudo apt-get install -y \
   steam \

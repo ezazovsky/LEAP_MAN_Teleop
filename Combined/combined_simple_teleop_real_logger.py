@@ -24,6 +24,17 @@ except ImportError:
     rs = None
 
 
+def get_next_numbered_filename(log_dir, prefix, suffix):
+    """Find the next available numbered filename in the format prefix_N.suffix"""
+    os.makedirs(log_dir, exist_ok=True)
+    counter = 0
+    while True:
+        filename = os.path.join(log_dir, f"{prefix}_{counter}{suffix}")
+        if not os.path.exists(filename):
+            return filename, counter
+        counter += 1
+
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 COMBINED_DIR = os.path.dirname(__file__)
 REALMAN_DIR = os.path.join(REPO_ROOT, "RMAPI", "Python")
@@ -147,14 +158,17 @@ class CameraProcess(mp.Process):
 
 class HDF5LoggingProcess(mp.Process):
     """Dedicated process for HDF5 disk I/O. Pulls from SHM and queues without blocking teleop."""
-    def __init__(self, log_queue, stop_event, output_path, args, width, height):
+    def __init__(self, log_queue, stop_event, output_path, metadata_path, metadata, args, width, height):
         super().__init__(daemon=True)
         self.log_queue = log_queue
         self.stop_event = stop_event
         self.output_path = output_path
+        self.metadata_path = metadata_path
+        self.metadata = metadata
         self.args = args
         self.width = width
         self.height = height
+        self.start_time = time.time()  # Record process start time
 
     def run(self):
         if h5py is None:
@@ -245,11 +259,58 @@ class HDF5LoggingProcess(mp.Process):
                     file.flush()
 
         finally:
+            total_time = time.time() - self.start_time
             file.attrs["sample_count"] = sample_count
+            file.attrs["total_time_seconds"] = total_time
             file.flush()
             file.close()
             if color_shm is not None:
                 color_shm.close()
+            
+            # Write metadata text file
+            self._write_metadata_file(sample_count, total_time)
+
+    def _write_metadata_file(self, sample_count, total_time):
+        """Write metadata to a text file."""
+        try:
+            metadata_lines = [
+                "================== Teleop Recording Metadata ==================",
+                f"Recording Date (UTC): {self.metadata['recording_date_utc']}",
+                f"Recording Date (Local): {self.metadata['recording_date_local']}",
+                "",
+                "--- Control Parameters ---",
+                f"Control Frequency (Hz): {self.args.control_hz}",
+                f"Interpolation Decay (Position): {self.metadata['alpha_pos']}",
+                f"Interpolation Decay (Rotation): {self.metadata['alpha_rot']}",
+                "",
+                "--- Recording Statistics ---",
+                f"Total Runtime (seconds): {total_time:.2f}",
+                f"Total Samples: {sample_count}",
+                f"Average Frequency (Hz): {sample_count / total_time if total_time > 0 else 0:.2f}",
+                "",
+                "--- Robot Configuration ---",
+                f"Robot IP: {self.args.robot_ip}",
+                f"Robot Port: {self.args.robot_port}",
+                f"Arm Position Scale: {self.metadata.get('arm_pos_scale', 'N/A')}",
+                f"Arm Rotation Scale: {self.metadata.get('arm_rot_scale', 'N/A')}",
+                "",
+                "--- Hardware Enabled ---",
+                f"Camera Enabled: {self.args.enable_camera}",
+                f"Hand Current Limit (mA): {self.args.hand_current_limit}",
+                f"Hand Side: {self.args.hand_side}",
+                "",
+                "--- File Information ---",
+                f"HDF5 Data File: {os.path.basename(self.output_path)}",
+                f"Metadata File: {os.path.basename(self.metadata_path)}",
+                "============================================================",
+            ]
+            
+            with open(self.metadata_path, 'w') as f:
+                f.write('\n'.join(metadata_lines))
+            
+            print(f"Metadata file written to: {self.metadata_path}")
+        except Exception as e:
+            print(f"[WARNING] Failed to write metadata file: {e}")
 
 
 class ManusErgonomicsSubscriber:
@@ -456,7 +517,28 @@ class CombinedSimpleTeleop:
             
         self.glove = ManusErgonomicsSubscriber(endpoint=self.args.zmq_endpoint, hand_side=self.args.hand_side)
 
-        log_path = self.args.log_path or os.path.join(REPO_ROOT, "Combined", "logs", f"teleop_{datetime.now().strftime('%Y%m%d_%H%M%S')}.hdf5")
+        # Generate numbered log files
+        log_dir = os.path.join(REPO_ROOT, "Combined", "logs")
+        if self.args.log_path:
+            # If user provided a custom path, use it as-is
+            log_path = self.args.log_path
+            metadata_path = log_path.replace('.hdf5', '.txt').replace('.HDF5', '.txt')
+        else:
+            # Use numbered scheme
+            log_path, file_number = get_next_numbered_filename(log_dir, "teleop_data", ".hdf5")
+            metadata_path = os.path.join(log_dir, f"teleop_metadata_{file_number}.txt")
+        
+        # Prepare metadata
+        now_utc = datetime.utcnow()
+        now_local = datetime.now()
+        metadata = {
+            'recording_date_utc': now_utc.isoformat() + "Z",
+            'recording_date_local': now_local.isoformat(),
+            'alpha_pos': self.interpolator.alpha_pos,
+            'alpha_rot': self.interpolator.alpha_rot,
+            'arm_pos_scale': self.args.arm_pos_scale,
+            'arm_rot_scale': self.args.arm_rot_scale,
+        }
         
         # Start Subprocesses
         if self.args.enable_camera:
@@ -464,9 +546,10 @@ class CombinedSimpleTeleop:
             self.camera_proc.start()
 
         if self.args.log_hdf5:
-            self.logger_proc = HDF5LoggingProcess(self.log_queue, self.sys_stop_event, log_path, self.args, DEFAULT_CAMERA_WIDTH, DEFAULT_CAMERA_HEIGHT)
+            self.logger_proc = HDF5LoggingProcess(self.log_queue, self.sys_stop_event, log_path, metadata_path, metadata, self.args, DEFAULT_CAMERA_WIDTH, DEFAULT_CAMERA_HEIGHT)
             self.logger_proc.start()
             print(f"HDF5 Async Logger started: {log_path}")
+            print(f"Metadata will be saved to: {metadata_path}")
 
         time.sleep(1)
         self.mapper.calibrate(countdown=self.args.calibration_countdown)
