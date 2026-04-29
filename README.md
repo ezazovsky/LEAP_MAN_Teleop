@@ -1,28 +1,28 @@
 # Bimanual Teleoperation with Recording & Replay
 
-Real-time control of a RealMan RM65 arm + LEAP Hand via Vive tracker + MANUS glove, with complete HDF5 recording of all trajectories and pipeline stages.
+Real-time control of a RealMan RM65 arm + LEAP Hand via Vive tracker + MANUS glove, with asynchronous HDF5 recording plus a human-readable metadata TXT sidecar.
 
 ## Quick Start
 
 ### Record a trajectory
 ```bash
-python combined_simple_teleop_real_logger.py
+python Combined/combined_simple_teleop_real_logger.py
 # Move Vive tracker to control arm, operate MANUS glove for hand
 # Ctrl+C to stop
-# File saved: logs/teleop_YYYYMMDD_HHMMSS.hdf5
+# Files saved: Combined/logs/teleop_data_N.hdf5 and Combined/logs/teleop_metadata_N.txt (recording date/time, control frequency, interpolation decay, runtime stats)
 ```
 
 ### Replay a trajectory
 ```bash
-python replay_hdf5.py logs/teleop_YYYYMMDD_HHMMSS.hdf5
+python Combined/replay_hdf5.py Combined/logs/teleop_data_0.hdf5
 # Arm homes to start position, then replays motion
 ```
 
 ## Documentation
 
 - **[INSTALLATION_AND_RUN.md](INSTALLATION_AND_RUN.md)** — Canonical lab setup guide for the MANUS SDK and combined teleop logger
-- **[SETUP_AND_EXECUTION.md](SETUP_AND_EXECUTION.md)** — Complete setup guide, installation, and all command options
-- **[DATA_PIPELINE.md](DATA_PIPELINE.md)** — Detailed explanation of data flow, processing stages, and file formats
+- **[Combined/EXECUTION_OPTIONS.md](Combined/EXECUTION_OPTIONS.md)** — Execution-only command and parameter reference
+- **[Combined/DATA_PIPELINE.md](Combined/DATA_PIPELINE.md)** — Detailed explanation of data flow, processing stages, and file formats
 
 ## Core Scripts
 
@@ -52,10 +52,10 @@ Hardware commands         Physical motion
 ## Key Features
 
 ✅ **Real-time control** at 125 Hz with safety bounds  
-✅ **Multi-stage logging** — raw, bounded, safe, smoothed poses  
+✅ **Multi-stage logging** — raw, safe, smoothed arm poses  
 ✅ **Hand safety** — automatically clips LEAP joint angles  
 ✅ **Smooth replay** — homing phase + trajectory smoothing  
-✅ **Data inspection** — HDF5 with full metadata and timing  
+✅ **Data inspection** — HDF5 datasets plus metadata TXT summary  
 ✅ **Hardware agnostic** — works with any poses via `robot_pose_controller.py`  
 
 ## Hardware
@@ -68,39 +68,44 @@ Hardware commands         Physical motion
 ## What Gets Recorded
 
 Each HDF5 file contains:
-- **Arm:** raw_pose, bounded_pose, safe_pose, smoothed_pose, hold_flag, canfd_status
-- **Hand:** manus_joints (raw), leap_pose (converted), has_glove_data
-- **Time:** monotonic_s, wall_time_s
-- **Metadata:** robot IP/port, control Hz, home pose, tracker calibration, etc.
+- **Arm:** raw_pose, safe_pose, smoothed_pose
+- **Hand:** manus_joints (raw), leap_pose (converted)
+- **Time:** monotonic_s
+- **Camera:** timestamp_ns and optional color frames when `--enable-camera` is used
+- **HDF5 attributes:** created_utc, robot_ip, control_hz, sample_count, total_time_seconds
 
-See `DATA_PIPELINE.md` for full schema details.
+Each recording also writes a compact metadata text sidecar:
+- **TXT sidecar:** `teleop_metadata_N.txt` (or `<log-path>.txt` when `--log-path` is used)
+- **TXT fields:** recording date in UTC/local time, control frequency, interpolation decay values, total runtime, total samples, and whether camera was enabled
+
+See `Combined/DATA_PIPELINE.md` for full schema details.
 
 ## Workflow Example
 
 ```bash
 # 1. Record
-python combined_simple_teleop_real_logger.py
+python Combined/combined_simple_teleop_real_logger.py
 # (3-second countdown, then teleoperate for ~30s)
 # Ctrl+C
-# → logs/teleop_20260419_162217.hdf5
+# → Combined/logs/teleop_data_0.hdf5 and Combined/logs/teleop_metadata_0.txt
 
 # 2. Inspect
-python replay_hdf5.py logs/teleop_20260419_162217.hdf5 --dry-run
+python Combined/replay_hdf5.py Combined/logs/teleop_data_0.hdf5 --dry-run
 # → Samples: 3750, Duration: 30s, First pose: [...], Samples with glove: 3750/3750
 
 # 3. Test replay (half speed)
-python replay_hdf5.py logs/teleop_20260419_162217.hdf5 --speed 0.5
+python Combined/replay_hdf5.py Combined/logs/teleop_data_0.hdf5 --speed 0.5
 # → 2s homing + 60s replay at half speed
 
 # 4. Full speed replay
-python replay_hdf5.py logs/teleop_20260419_162217.hdf5
+python Combined/replay_hdf5.py Combined/logs/teleop_data_0.hdf5
 # → 2s homing + 30s replay at real-time
 ```
 
 ## Troubleshooting
 
 **"Failed to connect to RealMan arm"**  
-→ Check arm powered on and at 192.168.1.18:8080. See [SETUP_AND_EXECUTION.md](SETUP_AND_EXECUTION.md#troubleshooting).
+→ Check arm powered on and at 192.168.1.18:8080. See [INSTALLATION_AND_RUN.md](INSTALLATION_AND_RUN.md).
 
 **"No Vive Trackers found"**  
 → Start SteamVR and pair tracker in controller settings.
@@ -108,7 +113,7 @@ python replay_hdf5.py logs/teleop_20260419_162217.hdf5
 **"Waiting for MANUS ergonomics data"**  
 → Start MANUS app and enable ergonomics broadcast on tcp://localhost:8000.
 
-See full troubleshooting guide in [SETUP_AND_EXECUTION.md](SETUP_AND_EXECUTION.md#troubleshooting).
+See run-order and issue notes in [INSTALLATION_AND_RUN.md](INSTALLATION_AND_RUN.md).
 
 ## Key Concepts
 
@@ -135,19 +140,21 @@ See full troubleshooting guide in [SETUP_AND_EXECUTION.md](SETUP_AND_EXECUTION.m
 
 ## For Your Research
 
-Use `DATA_PIPELINE.md` for:
+Use `Combined/DATA_PIPELINE.md` for:
 - Exact data flow with code locations
 - Processing stage details
 - Data type & shape reference
 - HDF5 schema documentation
 - Visual diagrams of the pipeline
 
-Use `SETUP_AND_EXECUTION.md` for:
-- Complete hardware & software setup
+Use `Combined/EXECUTION_OPTIONS.md` for:
 - All CLI flags and options
-- File format examples
-- Troubleshooting procedures
-- Best practices & safety guidelines
+- Execution examples for each runnable script
+
+Use `INSTALLATION_AND_RUN.md` for:
+- Hardware and software setup
+- Dependency installation
+- Run order and common issue handling
 
 ---
 

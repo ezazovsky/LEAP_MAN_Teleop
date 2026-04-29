@@ -1,289 +1,78 @@
-╔════════════════════════════════════════════════════════════════════════════╗
-║               BIMANUAL TELEOPERATION DOCUMENTATION INDEX                   ║
-╚════════════════════════════════════════════════════════════════════════════╝
+BIMANUAL TELEOPERATION DOCUMENTATION INDEX
+=========================================
 
-📖 START HERE
-─────────────
+START HERE
+----------
 README.md
-  • Quick start commands
-  • System overview & workflow
-  • Hardware requirements
-  • Troubleshooting quick reference
+  - Quick start (record/replay)
+  - What is recorded
+  - High-level architecture and links
 
+PRIMARY GUIDES
+--------------
+1) EXECUTION_OPTIONS.md
+   - Execution-only reference
+   - Runnable scripts and examples
+   - Full CLI parameter tables
 
-📋 COMPREHENSIVE GUIDES
-───────────────────────
+2) DATA_PIPELINE.md
+   - End-to-end data flow
+   - Safety/smoothing pipeline details
+   - HDF5 schema and replay stages
+   - Metadata TXT sidecar generation in recording pipeline
 
-1. SETUP_AND_EXECUTION.md (320 lines)
-   ├─ Physical hardware setup checklist
-   ├─ Software installation & verification
-   ├─ Pre-execution checklist
-   ├─ Live teleoperation (with 20+ command options)
-   ├─ Understanding console output
-   ├─ Replaying recordings (with 10+ command options)
-   ├─ Sending single poses
-   ├─ HDF5 inspection methods
-   ├─ Complete troubleshooting guide
-   ├─ Tips & best practices
-   └─ Quick start flowchart
+3) INSTALLATION_AND_RUN.md
+   - Environment and dependency setup
+   - MANUS SDK build/run steps
+   - Run order and common issues
 
-2. DATA_PIPELINE.md (450+ lines)
-   ├─ Complete data flow walkthrough
-   ├─ Stage 1A-1C: Data acquisition
-   │  ├─ Vive tracker input
-   │  ├─ MANUS glove input
-   │  ├─ RealSense camera input
-   │  └─ Data format details
-   ├─ Stage 2: Safety filter (6 steps explained)
-   │  ├─ Jump protection equations
-   │  ├─ Slew limiting math
-   │  ├─ Box clamp logic
-   │  ├─ Reach radius logic
-   │  └─ Boundary damping
-   ├─ Stage 3: Pose selection logic
-   ├─ Stage 4: Smoothing (EMA + SLERP)
-   ├─ Stage 4-H: Hand conversion & clipping
-   ├─ Stage 6: Hardware commands
-   ├─ Stage 7: HDF5 logging schema
-   │  ├─ arm/{raw_pose, safe_pose, smoothed_pose}
-   │  ├─ hand/{manus_joints, leap_pose}
-   │  ├─ camera/{timestamp_ns, color} when enabled
-   │  └─ Metadata attributes
-   ├─ Pipeline 2: Replay details
-   │  ├─ File loading
-   │  ├─ Robot connection
-   │  ├─ Safety filter re-seeding
-   │  ├─ Homing phase
-   │  ├─ Replay loop with timing
-   │  └─ Hardware commands
-   ├─ Data flow diagrams
-   ├─ Reference tables (shapes, types, ranges)
-   └─ Complete processing summary
+RECORDING OUTPUTS
+-----------------
+Running combined teleop logging produces two paired artifacts:
 
+- logs/teleop_data_N.hdf5
+  Structured datasets used by replay/analysis.
 
-🏃 THREE WAYS TO GET STARTED
-──────────────────────────────
+- logs/teleop_metadata_N.txt
+  Human-readable metadata summary for the matching HDF5 file.
 
-Scenario 1: "I just want to record"
-  → Read: README.md (Quick Start section)
-  → Run: python combined_simple_teleop_real_logger.py
-  → File: logs/teleop_YYYYMMDD_HHMMSS.hdf5
+If --log-path is provided (for example demo.hdf5), the sidecar becomes demo.txt.
 
-Scenario 2: "I need to set up the system"
-  → Read: SETUP_AND_EXECUTION.md (all sections)
-  → Follow: Pre-Execution Checklist
-  → Run: Test commands in Troubleshooting section
+RUNTIME FILES
+-------------
+combined_simple_teleop_real_logger.py
+  - Live teleop + async logging process
+  - Writes HDF5 plus metadata TXT sidecar
 
-Scenario 3: "I'm giving a research presentation"
-  → Read: DATA_PIPELINE.md (all sections)
-  → Reference: Diagrams, equations, and reference tables
-  → Explain: How data flows from sensors → recording → replay
+replay_hdf5.py
+  - Replays arm/hand trajectory from HDF5
+  - Optional video display when camera dataset exists
 
+robot_pose_controller.py
+  - Sends direct arm pose commands with safety filtering
 
-📁 FILE REFERENCE
-─────────────────
+verify_sync.py
+  - Visual validation of camera and trajectory timing
 
-combined_simple_teleop_real_logger.py (520 lines)
-  Main script: live teleoperation + HDF5 logging + camera capture
-  Logs: arm/{raw_pose, safe_pose, smoothed_pose}, hand/*, camera/*, timestamps
-  Usage: python combined_simple_teleop_real_logger.py [options]
-  Options: --enable-camera, --camera-width, --camera-height, --camera-fps, etc.
-  Default: records with HDF5 logging enabled; camera optional
+teleoperate.py
+  - Tracker-to-robot mapping and safety logic
 
-robot_pose_controller.py (420 lines)
-  Controller class: send any 6D pose + hand commands  
-  Usage: python robot_pose_controller.py --pose X Y Z Rx Ry Rz
-  Also imported by replay_hdf5.py
+track.py
+  - Vive/OpenVR tracker module
 
-replay_hdf5.py (370 lines)
-  Replay recorded trajectories from HDF5 with optional video playback
-  Loads: arm/smoothed_pose, hand/leap_pose, timestamps, camera/color (optional)
-  Usage: python replay_hdf5.py file.hdf5 [options]
-  Options: --speed, --show-video, --dry-run
-  Features: homing phase, smooth motion, timing preservation, video sync
-
-verify_sync.py (150 lines)
-  Verify sync between camera video and arm trajectory in HDF5 files
-  Visualizes: camera frames side-by-side with trajectory plot
-  Controls: Space=pause, Q=quit, arrows=scrub
-  Usage: python verify_sync.py logs/teleop_*.hdf5 [--speed MULTIPLIER]
-
-track.py (200+ lines)
-  Vive Tracker module for real-time tracking via OpenVR
-  Used by: combined_simple_teleop_real_logger.py
-  Provides: 4x4 transformation matrices, calibration, live tracker polling
-
-teleoperate.py (300+ lines)
-  Core ViveToRMMapper class for tracker→robot coordinate transforms
-  Implements: 6-step safety filter, pose smoothing, hold/move logic
-  Used by: combined_simple_teleop_real_logger.py, robot_pose_controller.py
-
-run_with_manus.sh
-  Convenience script to launch MANUS SDK and teleoperation together
-  Usage: ./run_with_manus.sh
-  Handles: virtualenv detection, SDK startup, HOME env for SteamVR
-
-leap_hand_utils/
-  Python utilities for LEAP Hand control
-  ├─ dynamixel_client.py: Dynamixel motor protocol
-  ├─ leap_hand_utils.py: joint/motor conversions
-
-logs/
-  Directory: HDF5 recordings (auto-created)
-  Format: teleop_YYYYMMDD_HHMMSS.hdf5
-  Size: ~5-10 MB/min without camera, ~100-200 MB/min with camera (compressed)
-
-
-🔍 KEY SECTIONS FOR PRESENTATIONS
-──────────────────────────────────
-
-For "System Architecture":
-  → DATA_PIPELINE.md: "Data Flow Diagram" section
-  → Shows: sensors → processing → hardware
-
-For "Safety Guarantees":
-  → DATA_PIPELINE.md: "Stage 2: Safety Bounds Filtering"
-  → Shows: all 6 safety steps with equations
-
-For "Data Collection":
-  → DATA_PIPELINE.md: "Stage 7: HDF5 Logging"
-  → Shows: complete schema, metadata, logging design
-
-For "Replay Mechanism":
-  → DATA_PIPELINE.md: "Pipeline 2: Replay from HDF5"
-  → Shows: homing → replay loop → hardware
-
-For "Experimental Results":
-  → SETUP_AND_EXECUTION.md: "Understanding Live Teleoperation Output"
-  → Shows: how to interpret console output and HDF5 data
-
-
-💾 REFERENCE TABLES (in DATA_PIPELINE.md)
-──────────────────────────────────────────
-
-Table: "Key Data Types & Shapes Reference"
-  All variables with shape, type, range, units
-
-Table: Safety bounds
-  X, Y, Z ranges, reach radius, rotation limits
-
-Table: LEAP Hand joint limits
-  Min/max angles in radians (16 joints)
-
-Table: Replay command options
-  All flags with defaults and descriptions
-
-
-🚀 COMMAND QUICK REFERENCE
-───────────────────────────
-
-Record (without camera):
+QUICK COMMANDS
+--------------
+Record:
   python combined_simple_teleop_real_logger.py
 
-Record (with camera):
-  python combined_simple_teleop_real_logger.py --enable-camera --camera-width 640 --camera-height 480 --camera-fps 30
+Replay:
+  python replay_hdf5.py logs/teleop_data_0.hdf5
 
-Replay (real-time):
-  python replay_hdf5.py logs/teleop_*.hdf5
+Dry-run inspect:
+  python replay_hdf5.py logs/teleop_data_0.hdf5 --dry-run
 
-Replay with video (real-time):
-  python replay_hdf5.py logs/teleop_*.hdf5 --show-video
+Sync visualization:
+  python verify_sync.py logs/teleop_data_0.hdf5
 
-Replay (half speed):
-  python replay_hdf5.py logs/teleop_*.hdf5 --speed 0.5
-
-Verify camera/arm sync in file:
-  python verify_sync.py logs/teleop_*.hdf5
-
-Inspect file info (dry-run):
-  python replay_hdf5.py logs/teleop_*.hdf5 --dry-run
-
-Send single pose:
+Single pose command:
   python robot_pose_controller.py --pose 0.3 0.0 0.2 0.0 0.0 0.0
-
-Convenient launch (with MANUS):
-  ./run_with_manus.sh
-
-Full help:
-  python combined_simple_teleop_real_logger.py --help
-  python replay_hdf5.py --help
-  python robot_pose_controller.py --help
-  python verify_sync.py --help
-
-
-📊 FOR RESEARCHERS
-───────────────────
-
-To understand the exact data flow:
-  1. Read DATA_PIPELINE.md systematically from top to bottom
-  2. Look at code locations cited for each stage
-  3. Refer to reference tables for data formats
-  4. Use diagrams to explain to others
-
-To reproduce results:
-  1. Check SETUP_AND_EXECUTION.md for all setup details
-  2. Follow "Pre-Execution Checklist" exactly
-  3. Use HDF5 inspection to verify data quality
-  4. Reference troubleshooting section for issues
-
-To train a diffusion or learning-based policy:
-  1. Record demonstrations with --enable-camera for context
-  2. Extract arm/raw_pose for unfiltered human intent (preserves corrections)
-  3. Extract camera/color for visual observations
-  4. Optionally use arm/safe_pose or arm/smoothed_pose for post-filtering
-  5. Use timestamp alignment for synchronization
-  6. See DATA_PIPELINE.md Stage 1B for raw_pose definition
-
-To compare with other systems:
-  Data_PIPELINE.md shows exact processing stages, so you can:
-  - Identify which stages are novel to this system
-  - Compare safety approaches (6-step filter documented)
-  - Evaluate logging completeness (raw, safe, smoothed arm data)
-  - Validate replay fidelity against recorded video
-  - Assess data density: all fields logged at control Hz (~125 Hz typical)
-
-
-✅ VERIFICATION
-────────────────
-
-Files present:
-  ✓ README.md
-  ✓ SETUP_AND_EXECUTION.md
-  ✓ DATA_PIPELINE.md
-  ✓ combined_simple_teleop_real_logger.py (updated: raw_pose logging, camera support)
-  ✓ robot_pose_controller.py
-  ✓ replay_hdf5.py (with video playback support)
-  ✓ verify_sync.py (new: camera/arm synchronization verification)
-  ✓ track.py (Vive tracker module)
-  ✓ teleoperate.py (core mapping & safety filter)
-  ✓ run_with_manus.sh (convenience launcher)
-  ✓ leap_hand_utils/ (LEAP Hand utilities)
-  ✓ logs/ (directory)
-
-Directory is clean:
-  ✓ No development/test files
-  ✓ No redundant scripts
-  ✓ Only essential code
-
-Documentation is complete:
-  ✓ Quick start guide
-  ✓ Detailed setup instructions
-  ✓ Comprehensive data pipeline explanation
-  ✓ Full command reference with camera options
-  ✓ Troubleshooting guide
-  ✓ Best practices
-  ✓ Researcher workflow for policy learning
-
-Data logging includes:
-  ✓ arm/raw_pose (unfiltered tracker data, ideal for learning)
-  ✓ arm/safe_pose (after safety filtering)
-  ✓ arm/smoothed_pose (what robot executes)
-  ✓ hand/manus_joints + hand/leap_pose
-  ✓ camera/timestamp_ns + camera/color (optional, LZF compressed)
-  ✓ Complete metadata attributes
-
-
-════════════════════════════════════════════════════════════════════════════
-Last updated: 2026-04-28 (added raw_pose logging, camera integration, verify_sync.py)
-For questions, refer to the detailed documentation files above.
-════════════════════════════════════════════════════════════════════════════

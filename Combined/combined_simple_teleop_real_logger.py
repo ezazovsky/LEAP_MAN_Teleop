@@ -286,22 +286,9 @@ class HDF5LoggingProcess(mp.Process):
                 "--- Recording Statistics ---",
                 f"Total Runtime (seconds): {total_time:.2f}",
                 f"Total Samples: {sample_count}",
-                f"Average Frequency (Hz): {sample_count / total_time if total_time > 0 else 0:.2f}",
                 "",
-                "--- Robot Configuration ---",
-                f"Robot IP: {self.args.robot_ip}",
-                f"Robot Port: {self.args.robot_port}",
-                f"Arm Position Scale: {self.metadata.get('arm_pos_scale', 'N/A')}",
-                f"Arm Rotation Scale: {self.metadata.get('arm_rot_scale', 'N/A')}",
-                "",
-                "--- Hardware Enabled ---",
+                "--- Recording Config ---",
                 f"Camera Enabled: {self.args.enable_camera}",
-                f"Hand Current Limit (mA): {self.args.hand_current_limit}",
-                f"Hand Side: {self.args.hand_side}",
-                "",
-                "--- File Information ---",
-                f"HDF5 Data File: {os.path.basename(self.output_path)}",
-                f"Metadata File: {os.path.basename(self.metadata_path)}",
                 "============================================================",
             ]
             
@@ -536,8 +523,6 @@ class CombinedSimpleTeleop:
             'recording_date_local': now_local.isoformat(),
             'alpha_pos': self.interpolator.alpha_pos,
             'alpha_rot': self.interpolator.alpha_rot,
-            'arm_pos_scale': self.args.arm_pos_scale,
-            'arm_rot_scale': self.args.arm_rot_scale,
         }
         
         # Start Subprocesses

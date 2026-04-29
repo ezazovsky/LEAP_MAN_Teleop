@@ -162,7 +162,7 @@ for i in [3, 4, 5]:
     pose[i] = last_pose[i] + (1 - damp_factor) * diff
 ```
 
-**Output:** `bounded_pose`
+**Output:** `filtered_pose`
 - **Format:** Python list, length 6
 - **Units:** meters, radians
 - **Logged:** not written to HDF5 in the current logger; used internally before `arm/safe_pose`
@@ -176,22 +176,21 @@ for i in [3, 4, 5]:
 
 ### Stage 3: Safe Pose Selection
 
-**Process:** Choose between bounded pose or hold last known good pose
+**Process:** Choose between safety-filter output or fallback hold pose
 
 **Location:** `combined_simple_teleop_real_logger.py`, lines 440-445
 
 ```python
-if bounded_pose is not None:
-    safe_pose = bounded_pose
-    is_holding = False
-else:
-    safe_pose = self.mapper.last_filtered_pose or self.mapper.robot_home_pose
-    is_holding = True  # hold last known good pose
+safe_pose = (
+    self.mapper.apply_safety_bounds(raw_pose)
+    or self.mapper.last_filtered_pose
+    or self.mapper.robot_home_pose
+)
 ```
 
 **Output:** `safe_pose`
 - **Format:** Python list, length 6
-- **Values:** Either bounded_pose OR last_filtered_pose (hold command)
+- **Values:** Safety-filtered pose, or fallback to last filtered/home pose
 - **Logged:** `arm/safe_pose` in HDF5
 - **Also used internally:** hold/no-hold state is not written as a separate HDF5 field in the current logger
 
@@ -350,7 +349,7 @@ MAX = [1.047,  2.23,   1.885,  2.042,  1.047,  2.23,   1.885,  2.042,
 
 ```python
 arm_ret = self.mapper.robot.rm_movep_canfd(
-    smoothed_pose_log,  # 6D Cartesian pose
+    smoothed_pose,      # 6D Cartesian pose
     True,               # high-follow mode (≤10ms cycle)
     trajectory_mode=1,  # curve fitting mode
     radio=20            # smoothing coefficient
@@ -383,14 +382,14 @@ self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
 
 ---
 
-### Stage 7: HDF5 Logging
+### Stage 7: Async Data Recording (HDF5 + Metadata TXT)
 
 **File Creation:**
 
-**Location:** `TeleopHDF5Logger.__init__()`, lines 46-96
+**Location:** `HDF5LoggingProcess.run()` in `combined_simple_teleop_real_logger.py`
 
 ```python
-self.file = h5py.File(output_path, "w")
+file = h5py.File(output_path, "w")
 
 datasets = {
     "time/monotonic_s":      (N,)            float64  - perf_counter() at loop start
@@ -410,17 +409,15 @@ datasets = {
 
 **Sample Append:**
 
-**Location:** `TeleopHDF5Logger.append_sample()`, lines 97-150
+**Location:** logger process main loop (`log_queue.get(...)`)
 
 ```python
-# Each call appends one row to all datasets
-index = sample_count
-for dataset_name, value in values.items():
-    dataset = self.datasets[dataset_name]
-    new_shape = list(dataset.shape)
-    new_shape[0] = index + 1
-    dataset.resize(tuple(new_shape))
-    dataset[index] = value
+# Each queue item appends one row to all datasets
+idx = sample_count
+for name, value in data["arrays"].items():
+    ds = datasets[name]
+    ds.resize((idx + 1, *ds.shape[1:]))
+    ds[idx] = value
 
 # Flush to disk every N samples (default 50)
 if sample_count % flush_every == 0:
@@ -434,12 +431,69 @@ file.attrs["created_utc"]          = "2026-04-19T21:22:17.010276Z"
 file.attrs["robot_ip"]             = "192.168.1.18"
 file.attrs["control_hz"]           = 125.0
 file.attrs["sample_count"]         = 1584  # written on close()
+file.attrs["total_time_seconds"]   = 12.66  # written on close()
+```
+
+**Stage 7B: Metadata TXT Sidecar**
+
+In addition to HDF5 attributes, the logger writes a human-readable metadata summary file next to the recording.
+
+Default naming (auto mode):
+- HDF5: `logs/teleop_data_N.hdf5`
+- TXT: `logs/teleop_metadata_N.txt`
+
+Custom path mode (`--log-path my_run.hdf5`):
+- HDF5: `my_run.hdf5`
+- TXT: `my_run.txt`
+
+**Metadata TXT File Structure:**
+
+```
+teleop_metadata_0.txt
+├── Recording Date (UTC)
+├── Recording Date (Local)
+├── Control Parameters
+│   ├── Control Frequency (Hz)
+│   ├── Interpolation Decay (Position)
+│   └── Interpolation Decay (Rotation)
+├── Recording Statistics
+│   ├── Total Runtime (seconds)
+│   └── Total Samples
+└── Recording Config
+    └── Camera Enabled
+```
+
+**Contents:**
+- recording date in UTC and local time
+- control and interpolation parameters
+- runtime statistics such as total samples
+- whether camera was enabled for this recording
+- no robot, hand, or file-name fields are written to the TXT sidecar
+
+**Example:**
+```
+================== Teleop Recording Metadata ==================
+Recording Date (UTC): 2026-04-28T14:25:25.123456Z
+Recording Date (Local): 2026-04-28T10:25:25.123456
+
+--- Control Parameters ---
+Control Frequency (Hz): 125.0
+Interpolation Decay (Position): 0.15
+Interpolation Decay (Rotation): 0.15
+
+--- Recording Statistics ---
+Total Runtime (seconds): 45.23
+Total Samples: 5654
+
+--- Recording Config ---
+Camera Enabled: False
+============================================================
 ```
 
 **Final HDF5 File Structure:**
 
 ```
-teleop_20260419_162217.hdf5
+teleop_data_0.hdf5
 ├── time/
 │   └── monotonic_s          (1584,)      perf timestamps
 ├── arm/
@@ -453,6 +507,9 @@ teleop_20260419_162217.hdf5
 │   ├── timestamp_ns         (1584,)      camera frame timestamps
 │   └── color                (1584,H,W,3) BGR video frames when enabled
 └── [attributes]              (metadata)
+
+teleop_metadata_0.txt
+└── human-readable metadata summary for the matching HDF5 file
 ```
 
 ---
@@ -478,10 +535,12 @@ with h5py.File(hdf5_path, "r") as f:
 - `hand_poses`: numpy array, shape `(1584, 16)`, dtype float64
 - `has_glove`: numpy array, shape `(1584,)`, dtype bool inferred from `hand/leap_pose`
 - `timestamps`: numpy array, shape `(1584,)`, dtype float64
-- `meta`: dict with creator, robot IP, control Hz, etc.
+- `meta`: dict with HDF5 file attributes such as `created_utc`, `robot_ip`, `control_hz`, `sample_count`, and `total_time_seconds`
 - `has_camera`: bool indicating whether `camera/color` is present in the file
 
 **Note:** The HDF5 file also contains `arm/raw_pose` (unfiltered tracker data) for potential analysis or policy learning. Replay always uses `arm/smoothed_pose` to reproduce the original smooth trajectory.
+
+The metadata TXT sidecar is informational for operators and experiment logs; replay reads the HDF5 file only.
 
 ---
 
@@ -713,6 +772,7 @@ All steps logged to file in parallel:
 - hand/{manus_joints, leap_pose}
 - camera/{timestamp_ns, color} when camera logging is enabled
 - time/{monotonic_s}
+- plus sidecar metadata text file: teleop_metadata_N.txt
 
 
 REPLAY PIPELINE

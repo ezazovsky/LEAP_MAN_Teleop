@@ -169,7 +169,12 @@ cd /home/rmtest/FRIRobot/Combined
 python combined_simple_teleop_real_logger.py
 ```
 
-The logger will create an HDF5 file under `Combined/logs/` by default.
+The logger will create two paired files under `Combined/logs/` by default:
+
+- `teleop_data_N.hdf5`
+- `teleop_metadata_N.txt` with recording date/time, control frequency, interpolation decay, and runtime statistics
+
+If you pass `--log-path custom_name.hdf5`, the paired metadata file is written as `custom_name.txt` with the same compact fields.
 
 ---
 
