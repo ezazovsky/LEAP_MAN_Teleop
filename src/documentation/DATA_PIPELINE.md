@@ -12,6 +12,17 @@ Real-time control with HDF5 recording of arm, hand, and synchronized RGB camera 
 ### Pipeline 2: Replay from Recording (replay_hdf5.py)
 Read HDF5 → Smooth homing → Replay trajectory at original timing.
 
+### Delta terminology used in this document
+
+- Home-referenced delta:
+    - Computed as inv(tracker_home_T) @ current_T.
+    - Used to construct arm target_pose from robot_home_pose.
+- Per-cycle step delta:
+    - Difference between target_pose and last_filtered_pose.
+    - Used only by safety filtering (jump/rate limiting).
+
+Unless noted otherwise, delta means home-referenced delta.
+
 ---
 
 ## Pipeline 1: Live Teleoperation + Logging
@@ -43,11 +54,11 @@ current_T = self.mapper.get_current_tracker_matrix()
 **Location:** `teleop_recorder.py`, lines 354-371
 
 ```python
-# 1. Compute delta from home calibration
+# 1. Compute home-referenced delta from calibration
 current_T = self.mapper.get_current_tracker_matrix()        # 4×4 matrix
 T_delta = np.linalg.inv(self.mapper.tracker_home_T) @ current_T  # relative transform
 
-# 2. Extract position delta
+# 2. Extract home-referenced position delta
 pos_delta = T_delta[:3, 3]  # [dx, dy, dz] in meters
 
 # 3. Remap coordinates (Vive frame → robot frame)
@@ -66,7 +77,7 @@ target_pose[3:] += euler_delta
 
 **Output:** `raw_pose`
 - **Format:** Python list, length 6
-- **Values:** `[x, y, z, rx, ry, rz]`
+- **Values:** `[x, y, z, rx, ry, rz]` (home-referenced target pose after remap + home anchor)
 - **Units:** meters, radians
 - **Data type:** float64
 - **Logged:** not written to HDF5 in the current logger; used internally to derive `arm/safe_pose`
@@ -87,11 +98,12 @@ target_pose[3:] += euler_delta
 **The 6 Safety Steps:**
 
 **Step 1: Jump Protection** (glitch filtering)
-- Position: Clamp max delta to `max_pos_jump = 0.1m` per cycle
+- Position: Clamp max per-cycle step from last filtered pose to `max_pos_jump = 0.1m`
 - Rotation: Slew-limit angular velocity to `max_rot_speed = 225°/s` with acceleration limit `450°/s²`
 
 ```python
 # Position jump
+# current = current target pose candidate, last = last_filtered_pose
 dist = ||current - last||
 if dist > max_pos_jump:
     scale = max_pos_jump / dist
@@ -194,6 +206,7 @@ safe_pose = (
 - **Logged:** `arm/safe_pose` in HDF5
 - **Also used internally:** hold/no-hold state is not written as a separate HDF5 field in the current logger
 
+ - **Values:** `[x, y, z, rx, ry, rz]` (home-referenced target pose after remap + home anchor)
 ---
 
 ### Stage 4: Arm Smoothing via EMA (Smoothed Pose)
@@ -393,7 +406,7 @@ file = h5py.File(output_path, "w")
 
 datasets = {
     "time/monotonic_s":         (N,)            float64         perf_counter() at loop start
-    "arm/raw_pose":             (N, 6)          float64         unfiltered tracker delta (for learning/analysis)
+    "arm/raw_pose":             (N, 6)          float64         unfiltered home-referenced target pose
     "arm/safe_pose":            (N, 6)          float64         pose after safety bounds / hold fallback
     "arm/smoothed_pose":        (N, 6)          float64         after EMA smoothing -> sent to robot
     "hand/manus_joints":        (N, 20)         float64         raw glove ergonomics, or NaNs if absent
