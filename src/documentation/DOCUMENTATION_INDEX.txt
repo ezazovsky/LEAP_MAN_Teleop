@@ -3,13 +3,13 @@ BIMANUAL TELEOPERATION DOCUMENTATION INDEX
 
 START HERE
 ----------
-README.md
+README.md (root level)
   - Quick start (record/replay)
   - What is recorded
   - High-level architecture and links
 
-PRIMARY GUIDES
---------------
+PRIMARY GUIDES (in documentation/ folder)
+-----------------------------------------
 1) EXECUTION_OPTIONS.md
    - Execution-only reference
    - Runnable scripts and examples
@@ -21,14 +21,24 @@ PRIMARY GUIDES
    - HDF5 schema and replay stages
    - Metadata TXT sidecar generation in recording pipeline
 
-3) INSTALLATION_AND_RUN.md
+3) COORDINATE_FRAMES.md
+   - Four-frame coordinate system
+   - Frame transformations step-by-step
+   - Axis remapping details
+   - Safety bounds enforcement
+
+4) INSTALLATION_AND_RUN.md
    - Environment and dependency setup
    - MANUS SDK build/run steps
    - Run order and common issues
 
+5) STEAMGUIDE.md
+  - SteamVR null-driver setup
+  - Headless SteamVR configuration
+
 RECORDING OUTPUTS
 -----------------
-Running combined teleop logging produces two paired artifacts:
+Running teleop logging produces two paired artifacts:
 
 - logs/teleop_data_N.hdf5
   Structured datasets used by replay/analysis.

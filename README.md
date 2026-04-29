@@ -20,9 +20,9 @@ python src/replay_hdf5.py src/logs/teleop_data_0.hdf5
 
 ## Documentation
 
-- **[INSTALLATION_AND_RUN.md](INSTALLATION_AND_RUN.md)** — Canonical lab setup guide for the MANUS SDK and combined teleop logger
-- **[src/EXECUTION_OPTIONS.md](src/EXECUTION_OPTIONS.md)** — Execution-only command and parameter reference
-- **[src/DATA_PIPELINE.md](src/DATA_PIPELINE.md)** — Detailed explanation of data flow, processing stages, and file formats
+- **[INSTALLATION_AND_RUN.md](src/documentation/INSTALLATION_AND_RUN.md)** — Canonical lab setup guide for the MANUS SDK and combined teleop logger
+- **[src/documentation/EXECUTION_OPTIONS.md](src/documentation/EXECUTION_OPTIONS.md)** — Execution-only command and parameter reference
+- **[src/documentation/DATA_PIPELINE.md](src/documentation/DATA_PIPELINE.md)** — Detailed explanation of data flow, processing stages, and file formats
 
 ## Core Scripts
 
@@ -78,7 +78,7 @@ Each recording also writes a compact metadata text sidecar:
 - **TXT sidecar:** `teleop_metadata_N.txt` (or `<log-path>.txt` when `--log-path` is used)
 - **TXT fields:** recording date in UTC/local time, control frequency, interpolation decay values, total runtime, total samples, and whether camera was enabled
 
-See `src/DATA_PIPELINE.md` for full schema details.
+See `src/documentation/DATA_PIPELINE.md` for full schema details.
 
 ## Workflow Example
 
@@ -105,7 +105,7 @@ python src/replay_hdf5.py src/logs/teleop_data_0.hdf5
 ## Troubleshooting
 
 **"Failed to connect to RealMan arm"**  
-→ Check arm powered on and at 192.168.1.18:8080. See [INSTALLATION_AND_RUN.md](INSTALLATION_AND_RUN.md).
+→ Check arm powered on and at 192.168.1.18:8080. See [INSTALLATION_AND_RUN.md](src/documentation/INSTALLATION_AND_RUN.md).
 
 **"No Vive Trackers found"**  
 → Start SteamVR and pair tracker in controller settings.
@@ -113,7 +113,7 @@ python src/replay_hdf5.py src/logs/teleop_data_0.hdf5
 **"Waiting for MANUS ergonomics data"**  
 → Start MANUS app and enable ergonomics broadcast on tcp://localhost:8000.
 
-See run-order and issue notes in [INSTALLATION_AND_RUN.md](INSTALLATION_AND_RUN.md).
+See run-order and issue notes in [INSTALLATION_AND_RUN.md](src/documentation/INSTALLATION_AND_RUN.md).
 
 ## Key Concepts
 
@@ -140,18 +140,18 @@ See run-order and issue notes in [INSTALLATION_AND_RUN.md](INSTALLATION_AND_RUN.
 
 ## For Your Research
 
-Use `src/DATA_PIPELINE.md` for:
+Use `src/documentation/DATA_PIPELINE.md` for:
 - Exact data flow with code locations
 - Processing stage details
 - Data type & shape reference
 - HDF5 schema documentation
 - Visual diagrams of the pipeline
 
-Use `src/EXECUTION_OPTIONS.md` for:
+Use `src/documentation/EXECUTION_OPTIONS.md` for:
 - All CLI flags and options
 - Execution examples for each runnable script
 
-Use `INSTALLATION_AND_RUN.md` for:
+Use `src/documentation/INSTALLATION_AND_RUN.md` for:
 - Hardware and software setup
 - Dependency installation
 - Run order and common issue handling

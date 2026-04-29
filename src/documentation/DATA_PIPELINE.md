@@ -910,4 +910,3 @@ REPLAY LOOP (for each sample i in 1..N)
 6. **Hardware command** → Cartesian arm + 16D hand
 7. **Logging** → All intermediate stages captured to HDF5
 8. **Replay** → Load HDF5 → Homing → Play at original speed
-
