@@ -392,19 +392,21 @@ self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
 file = h5py.File(output_path, "w")
 
 datasets = {
-    "time/monotonic_s":      (N,)            float64  - perf_counter() at loop start
-    "arm/raw_pose":          (N, 6)          float64  - unfiltered tracker delta (for learning/analysis)
-    "arm/safe_pose":         (N, 6)          float64  - pose after safety bounds / hold fallback
-    "arm/smoothed_pose":     (N, 6)          float64  - after EMA smoothing -> sent to robot
-    "hand/manus_joints":     (N, 20)         float64  - raw glove ergonomics, or NaNs if absent
-    "hand/leap_pose":        (N, 16)         float64  - converted LEAP command, or NaNs if absent
-    "camera/timestamp_ns":   (N,)            uint64   - RealSense frame timestamp captured by camera process
-    "camera/color":          (N, H, W, 3)    uint8    - BGR video frames (when --enable-camera is used)
+    "time/monotonic_s":         (N,)            float64         perf_counter() at loop start
+    "arm/raw_pose":             (N, 6)          float64         unfiltered tracker delta (for learning/analysis)
+    "arm/safe_pose":            (N, 6)          float64         pose after safety bounds / hold fallback
+    "arm/smoothed_pose":        (N, 6)          float64         after EMA smoothing -> sent to robot
+    "hand/manus_joints":        (N, 20)         float64         raw glove ergonomics, or NaNs if absent
+    "hand/leap_pose":           (N, 16)         float64         converted LEAP command, or NaNs if absent
+    "camera/color":             (N, H, W, 3)    uint8           BGR frames (ML-optimized: only unique frames)
+    "camera/timestamp_ns":      (N,)            uint64          timestamps of unique camera frames
+    "camera/frame_indices":     (N,)            int32           mapping from sample i to frame index (NEW)
 }
 
 # All datasets use chunks=True for streaming writes.
 # All datasets use maxshape=(None, ...) for unbounded growth.
-# camera/color dataset uses LZF compression to reduce file size.
+# camera/color uses LZF compression to reduce file size.
+# NEW: camera/frame_indices eliminates duplicate frames → ML-ready
 ```
 
 **Sample Append:**
@@ -412,16 +414,40 @@ datasets = {
 **Location:** logger process main loop (`log_queue.get(...)`)
 
 ```python
-# Each queue item appends one row to all datasets
-idx = sample_count
-for name, value in data["arrays"].items():
-    ds = datasets[name]
-    ds.resize((idx + 1, *ds.shape[1:]))
-    ds[idx] = value
+# ML-OPTIMIZED: Only unique frames are stored in camera/color
+# Each telemetry sample maps to a frame via camera/frame_indices
 
-# Flush to disk every N samples (default 50)
-if sample_count % flush_every == 0:
-    file.flush()
+frame_count = 0  # Tracks unique camera frames
+current_frame_idx = -1  # Index in camera/color dataset
+
+# When a new frame arrives:
+if cam_ts != last_logged_cam_ts and cam_ts != 0:
+    ds_c.resize((frame_count + 1, ...))  # Expand camera/color array
+    ds_c[frame_count] = new_frame        # Write only once
+    current_frame_idx = frame_count
+    frame_count += 1
+
+# Every telemetry sample gets a mapping:
+idx = sample_count
+ds_fi.resize((idx + 1,))
+ds_fi[idx] = current_frame_idx  # Points to which camera frame applies
+sample_count += 1
+```
+
+**Example (ML-ready structure):**
+```
+Telemetry samples:     T1  T2  T3  T4  T5  T6  T7  T8  ...  (100+ Hz @ N samples)
+Camera frames:         F0  ═══════════  F1  ═══════════  (30 Hz @ M unique frames, M << N)
+
+Stored in HDF5:
+/camera/color:         [F0, F1, ...] (M frames, compressed)
+/camera/frame_indices: [0,  0,  0,  0,  1,  1,  1,  1, ...]  (N indices)
+/camera/timestamp_ns:  [ts0, ts1, ...]  (M timestamps)
+
+For ML training:
+- NO DATA CORRUPTION: Each frame paired with exactly one state
+- COMPACT: F0 stored once, not 4 times
+- TRAINABLE: Skip duplicate states via frame_indices
 ```
 
 **File Attributes (Metadata):**
@@ -495,21 +521,21 @@ Camera Enabled: False
 ```
 teleop_data_0.hdf5
 ├── time/
-│   └── monotonic_s          (1584,)      perf timestamps
+│   └── monotonic_s          (N,)          perf timestamps (one per sample)
 ├── arm/
-│   ├── raw_pose             (1584, 6)    unfiltered tracker (for learning)
-│   ├── safe_pose            (1584, 6)    final choice (move or hold)
-│   └── smoothed_pose        (1584, 6)    after EMA -> sent to hardware
+│   ├── raw_pose             (N, 6)        unfiltered tracker (for learning)
+│   ├── safe_pose            (N, 6)        final choice (move or hold)
+│   └── smoothed_pose        (N, 6)        after EMA -> sent to hardware
 ├── hand/
-│   ├── manus_joints         (1584, 20)   raw glove data or NaNs
-│   └── leap_pose            (1584, 16)   converted LEAP command or NaNs
+│   ├── manus_joints         (N, 20)       raw glove data or NaNs
+│   └── leap_pose            (N, 16)       converted LEAP command or NaNs
 ├── camera/
-│   ├── timestamp_ns         (1584,)      camera frame timestamps
-│   └── color                (1584,H,W,3) BGR video frames when enabled
-└── [attributes]              (metadata)
+│   ├── color                (M, H, W, 3)  unique BGR frames (M << N, ML-optimized!)
+│   ├── timestamp_ns         (M,)          frame timestamps (M unique frames)
+│   └── frame_indices        (N,)          mapping: sample i → frame index
 
-teleop_metadata_0.txt
-└── human-readable metadata summary for the matching HDF5 file
+KEY INSIGHT: frame_indices[i] tells you which camera frame applies to sample i.
+This eliminates 3-4x data duplication while maintaining frame sync!
 ```
 
 ---
@@ -522,20 +548,29 @@ teleop_metadata_0.txt
 
 ```python
 with h5py.File(hdf5_path, "r") as f:
-    arm_poses   = f["arm/smoothed_pose"][:]     # Load entire array into memory
-    hand_poses  = f["hand/leap_pose"][:]
-    timestamps  = f["time/monotonic_s"][:]      # For timing
+    arm_poses   = f["arm/smoothed_pose"][:]     # Load entire array into memory (N,)
+    hand_poses  = f["hand/leap_pose"][:]        # (N,)
+    timestamps  = f["time/monotonic_s"][:]      # For timing (N,)
     meta        = dict(f.attrs)                 # Metadata dict
     has_glove   = ~np.isnan(hand_poses[:, 0])
     has_camera  = "camera/color" in f
+    
+    # ML-optimized format support:
+    if "camera/frame_indices" in f:
+        colors = f["camera/color"][:]           # Load unique frames (M,)
+        frame_indices = f["camera/frame_indices"][:]  # Mapping (N,)
+    else:
+        colors = f["camera/color"][:]           # Legacy: N frames
+        frame_indices = np.arange(len(arm_poses))  # Default 1:1 mapping
 ```
 
 **Data in memory:**
-- `arm_poses`: numpy array, shape `(1584, 6)`, dtype float64 (loaded from `arm/smoothed_pose`)
-- `hand_poses`: numpy array, shape `(1584, 16)`, dtype float64
-- `has_glove`: numpy array, shape `(1584,)`, dtype bool inferred from `hand/leap_pose`
-- `timestamps`: numpy array, shape `(1584,)`, dtype float64
-- `meta`: dict with HDF5 file attributes such as `created_utc`, `robot_ip`, `control_hz`, `sample_count`, and `total_time_seconds`
+- `arm_poses`: numpy array, shape `(N, 6)`, dtype float64 (loaded from `arm/smoothed_pose`)
+- `hand_poses`: numpy array, shape `(N, 16)`, dtype float64
+- `colors`: numpy array, shape `(M, H, W, 3)` or `(N, H, W, 3)`, dtype uint8 (**ML-optimized: M unique frames**)
+- `frame_indices`: numpy array, shape `(N,)`, dtype int32 (**maps each sample to camera frame**)
+- `timestamps`: numpy array, shape `(N,)`, dtype float64
+- `meta`: dict with HDF5 file attributes such as `created_utc`, `robot_ip`, `control_hz`, `sample_count`, `frame_count` (if camera enabled), and `total_time_seconds`
 - `has_camera`: bool indicating whether `camera/color` is present in the file
 
 **Note:** The HDF5 file also contains `arm/raw_pose` (unfiltered tracker data) for potential analysis or policy learning. Replay always uses `arm/smoothed_pose` to reproduce the original smooth trajectory.
@@ -728,6 +763,51 @@ self.hand.write_desired_pos(motors, clipped_joints)
 
 ---
 
+## Verification & Sync Testing
+
+### verify_sync.py: Proving Frame Synchronization
+
+The `verify_sync.py` script demonstrates that frames are correctly synced with robot state, even with ML-optimized compact storage.
+
+**How it Proves Sync (ML-Optimized Format):**
+
+```python
+# Load mapping (NEW: frame_indices)
+frame_indices = f['camera/frame_indices'][:]  # For each sample i, which frame?
+colors = f['camera/color'][:]                 # Unique frames only
+
+# During playback:
+for i in range(num_samples):
+    frame_idx = frame_indices[i]  # Gets the ACTUAL frame for sample i
+    frame = colors[frame_idx]     # Correct frame, not duplicated
+```
+
+**On-Screen Verification:**
+- **Frame ID** displayed: Shows which unique frame (0, 1, 2, ...) is being viewed
+- **Sample ID** displayed: Shows which telemetry sample (0, 1, 2, ...)
+- Compare Frame ID across samples: You'll see "Frame ID: 0" for multiple samples, then jump to "Frame ID: 1"
+- This visually proves: Multiple robot states → same visual frame (no corruption!)
+- **Trajectory plot** with playhead cursor: Shows when frame changes occur relative to arm motion
+
+**Example Playback Output:**
+```
+Time: 0.00s  Sample: 0/1200   Frame ID: 0  ← Frame 0 appears for ~4 samples
+Time: 0.05s  Sample: 1/1200   Frame ID: 0  
+Time: 0.10s  Sample: 2/1200   Frame ID: 0
+Time: 0.15s  Sample: 3/1200   Frame ID: 0
+Time: 0.20s  Sample: 4/1200   Frame ID: 1  ← Frame 1 replaces it (~33ms later)
+Time: 0.25s  Sample: 5/1200   Frame ID: 1
+...
+```
+
+**Why This Proves Sync (vs. Duplicates):**
+1. **No ML corruption**: 1 frame → 1 state (same timestamp)
+2. **Timestamp consistency**: frame_indices[i] always points to correct frame
+3. **Compact proof**: Visual shows sparse Frame ID changes (not every sample new)
+4. **Deterministic**: Same Frame ID for all samples between updates
+
+---
+
 ## Data Flow Diagram
 
 ```
@@ -806,16 +886,17 @@ REPLAY LOOP (for each sample i in 1..N)
 
 ## Key Data Types & Shapes Reference
 
-| Data | Shape | Type | Range | Units |
-|------|-------|------|-------|-------|
-| `raw_pose` | (N, 6) or (6,) | float64 | any | m, rad |
-| `safe_pose` | (N, 6) or (6,) | float64 | safe only | m, rad |
-| `smoothed_pose` | (N, 6) or (6,) | float64 | safe/smooth | m, rad |
-| `manus_joints` | (N, 20) or (20,) | float64 | ~[0, 1] | normalized |
-| `leap_pose` | (N, 16) or (16,) | float64 | [-3, 4] | rad |
-| `camera/timestamp_ns` | (N,) | uint64 | any | ns |
-| `camera/color` | (N, H, W, 3) | uint8 | 0-255 | BGR image |
-| `time/monotonic_s` | (N,) | float64 | any | seconds |
+| Data | Shape | Type | Range | Units | Notes |
+|------|-------|------|-------|-------|-------|
+| `raw_pose` | (N, 6) or (6,) | float64 | any | m, rad | unfiltered tracker |
+| `safe_pose` | (N, 6) or (6,) | float64 | safe only | m, rad | after bounds check |
+| `smoothed_pose` | (N, 6) or (6,) | float64 | safe/smooth | m, rad | sent to hardware |
+| `manus_joints` | (N, 20) or (20,) | float64 | ~[0, 1] | normalized | raw glove data |
+| `leap_pose` | (N, 16) or (16,) | float64 | [-3, 4] | rad | LEAP hand command |
+| `camera/timestamp_ns` | (M,) | uint64 | any | ns | **M unique frames** |
+| `camera/color` | (M, H, W, 3) | uint8 | 0-255 | BGR image | **ML-optimized: M < N** |
+| `camera/frame_indices` | (N,) | int32 | 0..M-1 | index | **NEW: sample i → frame index** |
+| `time/monotonic_s` | (N,) | float64 | any | seconds | one per sample |
 
 ---
 

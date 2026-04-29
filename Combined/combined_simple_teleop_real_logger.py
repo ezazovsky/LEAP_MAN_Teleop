@@ -203,9 +203,14 @@ class HDF5LoggingProcess(mp.Process):
         }
 
         if self.args.enable_camera:
+            # ML-optimized: Only store unique frames + mapping index
             datasets["camera/color"] = file.create_dataset(
                 "camera/color", (0, self.height, self.width, 3), maxshape=(None, self.height, self.width, 3),
                 dtype=np.uint8, chunks=(1, self.height, self.width, 3), compression="lzf"
+            )
+            # Mapping: for each telemetry sample, which camera frame index applies
+            datasets["camera/frame_indices"] = file.create_dataset(
+                "camera/frame_indices", (0,), maxshape=(None,), dtype=np.int32, chunks=True
             )
 
             # Wait for CameraProcess to initialize shared memory
@@ -219,6 +224,9 @@ class HDF5LoggingProcess(mp.Process):
             if color_shm:
                 color_arr = np.ndarray((self.height, self.width, 3), dtype=np.uint8, buffer=color_shm.buf)
 
+        frame_count = 0  # Track unique camera frames separately
+        current_frame_idx = -1  # Index of current frame in camera/color dataset
+        
         try:
             while True:
                 try:
@@ -232,27 +240,33 @@ class HDF5LoggingProcess(mp.Process):
 
                 cam_ts = data.get("camera_ts", 0)
                 
-                # Copy from SHM only if it's a new frame to avoid redundant disk writes
+                # ML-OPTIMIZED: Only write frame when it's new, avoid duplication
                 if self.args.enable_camera and color_shm and cam_ts != last_logged_cam_ts and cam_ts != 0:
                     np.copyto(local_color, color_arr)
                     last_logged_cam_ts = cam_ts
+                    
+                    # Write new frame to camera/color dataset
+                    ds_c = datasets["camera/color"]
+                    ds_ts = datasets["camera/timestamp_ns"]
+                    ds_c.resize((frame_count + 1, *ds_c.shape[1:]))
+                    ds_ts.resize((frame_count + 1,))
+                    ds_c[frame_count] = local_color
+                    ds_ts[frame_count] = cam_ts
+                    current_frame_idx = frame_count
+                    frame_count += 1
 
-                # Resize and write datasets
+                # Resize and write telemetry datasets
                 idx = sample_count
                 for name, value in data["arrays"].items():
                     ds = datasets[name]
                     ds.resize((idx + 1, *ds.shape[1:]))
                     ds[idx] = value
 
-                if self.args.enable_camera and color_shm:
-                    ds_c = datasets["camera/color"]
-                    ds_ts = datasets["camera/timestamp_ns"]
-                    
-                    ds_c.resize((idx + 1, *ds_c.shape[1:]))
-                    ds_ts.resize((idx + 1,))
-                    
-                    ds_c[idx] = local_color
-                    ds_ts[idx] = cam_ts
+                # Write frame index mapping (for each telemetry sample, which camera frame applies)
+                if self.args.enable_camera:
+                    ds_fi = datasets["camera/frame_indices"]
+                    ds_fi.resize((idx + 1,))
+                    ds_fi[idx] = current_frame_idx
 
                 sample_count += 1
                 if sample_count % flush_every == 0:
@@ -261,6 +275,8 @@ class HDF5LoggingProcess(mp.Process):
         finally:
             total_time = time.time() - self.start_time
             file.attrs["sample_count"] = sample_count
+            if self.args.enable_camera:
+                file.attrs["frame_count"] = frame_count
             file.attrs["total_time_seconds"] = total_time
             file.flush()
             file.close()

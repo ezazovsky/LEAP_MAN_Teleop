@@ -13,6 +13,9 @@ except ImportError as e:
     print("Please run: pip install h5py numpy opencv-python matplotlib")
     sys.exit(1)
 
+DEFAULT_CAM_WIDTH = 640
+DEFAULT_CAM_HEIGHT = 480
+
 
 def visualize(hdf5_path, playback_speed=1.0):
     if not os.path.exists(hdf5_path):
@@ -27,15 +30,28 @@ def visualize(hdf5_path, playback_speed=1.0):
         print(f"[ERROR] Could not open HDF5 file. Was it closed properly? {e}")
         return
 
-    if 'camera/color' not in f or 'arm/smoothed_pose' not in f:
-        print("[ERROR] Missing required datasets in HDF5 file. Ensure camera was enabled.")
+    if 'arm/smoothed_pose' not in f:
+        print("[ERROR] Missing arm/smoothed_pose dataset in HDF5 file.")
         f.close()
         return
 
     # Load telemetry into memory (Camera frames stay on disk to save RAM)
     times = f['time/monotonic_s'][:]
     poses = f['arm/smoothed_pose'][:]  # [X, Y, Z, Rx, Ry, Rz]
-    colors = f['camera/color']
+    
+    # Handle camera data (may not be present or may use new ML-optimized format)
+    has_camera = 'camera/color' in f
+    colors = None
+    frame_indices = None
+    
+    if has_camera:
+        colors = f['camera/color']
+        # Check for new ML-optimized format with frame_indices mapping
+        if 'camera/frame_indices' in f:
+            frame_indices = f['camera/frame_indices'][:]
+        else:
+            # Legacy format: frames duplicated at same rate as telemetry
+            frame_indices = np.arange(len(times), dtype=np.int32)
     
     num_samples = len(times)
     t_rel = times - times[0]  # Start at 0 seconds
@@ -74,8 +90,22 @@ def visualize(hdf5_path, playback_speed=1.0):
     while i < num_samples:
         if i < 0: i = 0
         
-        # 1. Grab the camera frame
-        frame = colors[i].copy() 
+        # 1. Get the appropriate camera frame for this sample
+        if has_camera and colors is not None and frame_indices is not None:
+            frame_idx = frame_indices[i]
+            if frame_idx >= 0 and frame_idx < len(colors):
+                frame = colors[frame_idx].copy()
+            else:
+                # Frame not yet available, use black frame
+                frame = np.zeros((DEFAULT_CAM_HEIGHT, DEFAULT_CAM_WIDTH, 3), dtype=np.uint8)
+        else:
+            # No camera data, use black frame
+            frame = np.zeros((DEFAULT_CAM_HEIGHT, DEFAULT_CAM_WIDTH, 3), dtype=np.uint8) if has_camera else None
+        
+        if frame is None:
+            i += 1
+            continue
+            
         cam_h, cam_w = frame.shape[:2]
 
         # 2. Resize plot image to exactly match the camera height for a seamless side-by-side
@@ -98,8 +128,14 @@ def visualize(hdf5_path, playback_speed=1.0):
         # 5. Overlay text stats on the video feed
         cv2.putText(frame, f"Time: {t_rel[i]:.2f}s", (15, 35), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(frame, f"Idx: {i}/{num_samples}", (15, 75), 
+        cv2.putText(frame, f"Sample: {i}/{num_samples}", (15, 75), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # Show frame index (for ML optimization validation)
+        if has_camera and frame_indices is not None:
+            frame_id = frame_indices[i]
+            cv2.putText(frame, f"Frame ID: {frame_id}", (15, 110), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
         # Combine Video + Graph
         combined_view = np.hstack((frame, current_plot))
