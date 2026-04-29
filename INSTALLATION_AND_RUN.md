@@ -3,7 +3,7 @@
 This document captures the minimum setup required to run the two pieces of this project that depend on external software:
 
 1. The MANUS Core 2.4.0 SDK client under `LMAPI/`
-2. The combined teleoperation logger under `Combined/`
+2. The combined teleoperation logger under `src/`
 
 The steps below are written for Ubuntu-based Linux systems, which is the recommended environment for this repository.
 
@@ -87,9 +87,9 @@ If you are using a Windows machine as the MANUS Core host and a separate Linux m
 
 ---
 
-## 3. Install the Combined Logger Dependencies
+## 3. Install the src Logger Dependencies
 
-The combined logger lives in `Combined/combined_simple_teleop_real_logger.py`. It depends on the RealMan SDK, the LEAP hand utilities bundled in this repository, OpenVR for tracker input, ZMQ for MANUS data, and HDF5 for logging.
+The combined logger lives in `src/teleop_recorder.py`. It depends on the RealMan SDK, the LEAP hand utilities bundled in this repository, OpenVR for tracker input, ZMQ for MANUS data, and HDF5 for logging.
 
 ### 3.1 Create a Python environment
 
@@ -119,7 +119,7 @@ Optional, only if you want to enable the camera logging path:
 pip install pyrealsense2
 ```
 
-Optional, only if you want the interactive debugger hook used by `Combined/track.py`:
+Optional, only if you want the interactive debugger hook used by `src/track.py`:
 
 ```bash
 pip install ipython
@@ -129,7 +129,7 @@ Notes:
 
 - `Robotic_Arm` provides the RealMan Python interface used by the logger.
 - `dynamixel_sdk` is required by the LEAP hand controller.
-- The repository already includes `Combined/leap_hand_utils/`, so no extra install step is needed for that package.
+- The repository already includes `src/leap_hand_utils/`, so no extra install step is needed for that package.
 
 ### 3.3 Verify the Python dependencies
 
@@ -162,14 +162,14 @@ The teleoperation stack should be started in this order:
 1. Power on the hardware: RealMan arm, LEAP Hand, Vive Tracker, and MANUS gloves.
 2. Start SteamVR and confirm the Vive Tracker is visible.
 3. Start the MANUS SDK client and confirm it is publishing ergonomics data on `tcp://127.0.0.1:8000` or the configured host endpoint.
-4. Run the combined logger from `Combined/`.
+4. Run the combined logger from `src/`.
 
 ```bash
-cd /home/rmtest/FRIRobot/Combined
-python combined_simple_teleop_real_logger.py
+cd /home/rmtest/FRIRobot/src
+python teleop_recorder.py
 ```
 
-The logger will create two paired files under `Combined/logs/` by default:
+The logger will create two paired files under `src/logs/` by default:
 
 - `teleop_data_N.hdf5`
 - `teleop_metadata_N.txt` with recording date/time, control frequency, interpolation decay, and runtime statistics
@@ -188,8 +188,8 @@ cd /home/rmtest/FRIRobot/LMAPI/MANUS_Core_2.4.0_SDK/SDKClient_Linux
 ./SDKClient_Linux.out
 
 # Python-side dependency check
-cd /home/rmtest/FRIRobot/Combined
-python combined_simple_teleop_real_logger.py --help
+cd /home/rmtest/FRIRobot/src
+python teleop_recorder.py --help
 ```
 
 If the logger help text appears without import errors, the Python environment is close to ready.
@@ -210,7 +210,7 @@ If the logger help text appears without import errors, the Python environment is
 ## 7. What Depends On What
 
 - `LMAPI/MANUS_Core_2.4.0_SDK/SDKClient_Linux/` provides the glove data stream consumed by the logger.
-- `Combined/combined_simple_teleop_real_logger.py` provides live arm control and HDF5 logging.
-- `Combined/replay_hdf5.py` replays the saved logs created by the logger.
+- `src/teleop_recorder.py` provides live arm control and HDF5 logging.
+- `src/replay_hdf5.py` replays the saved logs created by the logger.
 
 If you only need to record new teleoperation data, the two critical runtime pieces are the MANUS SDK client and the combined logger.

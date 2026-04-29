@@ -11,7 +11,7 @@ The script performs two phases:
 Usage
 -----
     # Real-time replay with smooth filter mode (default)
-    python replay_hdf5.py Combined/logs/teleop_20240101_120000.hdf5
+    python replay_hdf5.py src/logs/teleop_20240101_120000.hdf5
 
     # Replay AND show the recorded RealSense video feed in sync
     python replay_hdf5.py recording.hdf5 --show-video

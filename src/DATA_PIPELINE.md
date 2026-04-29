@@ -6,7 +6,7 @@ Complete walkthrough of how data flows through the bimanual teleoperation system
 
 ## Overview: Two Pipelines
 
-### Pipeline 1: Live Teleoperation + Logging (combined_simple_teleop_real_logger.py)
+### Pipeline 1: Live Teleoperation + Logging (teleop_recorder.py)
 Real-time control with HDF5 recording of arm, hand, and synchronized RGB camera data.
 
 ### Pipeline 2: Replay from Recording (replay_hdf5.py)
@@ -27,7 +27,7 @@ ViveTrackerModule.get_T()
   → Rotation as 3×3 matrix
 ```
 
-**Location:** `combined_simple_teleop_real_logger.py`, line 354
+**Location:** `teleop_recorder.py`, line 354
 ```python
 current_T = self.mapper.get_current_tracker_matrix()
 ```
@@ -40,7 +40,7 @@ current_T = self.mapper.get_current_tracker_matrix()
 
 **Process:** Transform tracker matrix into Cartesian pose relative to home position
 
-**Location:** `combined_simple_teleop_real_logger.py`, lines 354-371
+**Location:** `teleop_recorder.py`, lines 354-371
 
 ```python
 # 1. Compute delta from home calibration
@@ -82,7 +82,7 @@ target_pose[3:] += euler_delta
 
 **Process:** Apply 6-step safety filter to prevent workspace violations
 
-**Location:** `teleoperate.py`, `apply_safety_bounds()` method (copied into `robot_pose_controller.py`)
+**Location:** `realman_utils.py`, `apply_safety_bounds()` method (copied into `robot_pose_controller.py`)
 
 **The 6 Safety Steps:**
 
@@ -178,7 +178,7 @@ for i in [3, 4, 5]:
 
 **Process:** Choose between safety-filter output or fallback hold pose
 
-**Location:** `combined_simple_teleop_real_logger.py`, lines 440-445
+**Location:** `teleop_recorder.py`, lines 440-445
 
 ```python
 safe_pose = (
@@ -345,7 +345,7 @@ MAX = [1.047,  2.23,   1.885,  2.042,  1.047,  2.23,   1.885,  2.042,
 
 **Arm Hardware:**
 
-**Location:** `combined_simple_teleop_real_logger.py`, line 455
+**Location:** `teleop_recorder.py`, line 455
 
 ```python
 arm_ret = self.mapper.robot.rm_movep_canfd(
@@ -386,7 +386,7 @@ self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
 
 **File Creation:**
 
-**Location:** `HDF5LoggingProcess.run()` in `combined_simple_teleop_real_logger.py`
+**Location:** `HDF5LoggingProcess.run()` in `teleop_recorder.py`
 
 ```python
 file = h5py.File(output_path, "w")

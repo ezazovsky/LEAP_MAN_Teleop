@@ -13,11 +13,11 @@ import time
 import numpy as np
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-COMBINED_DIR = os.path.dirname(__file__)
+SRC_DIR = os.path.dirname(__file__)
 REALMAN_DIR = os.path.join(REPO_ROOT, "RMAPI", "Python")
 MANUS_PY_DIR = os.path.join(REPO_ROOT, "LMAPI", "python")
 
-for _p in [COMBINED_DIR, REALMAN_DIR, MANUS_PY_DIR]:
+for _p in [SRC_DIR, REALMAN_DIR, MANUS_PY_DIR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

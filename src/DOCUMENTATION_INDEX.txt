@@ -40,7 +40,7 @@ If --log-path is provided (for example demo.hdf5), the sidecar becomes demo.txt.
 
 RUNTIME FILES
 -------------
-combined_simple_teleop_real_logger.py
+teleop_recorder.py
   - Live teleop + async logging process
   - Writes HDF5 plus metadata TXT sidecar
 
@@ -54,7 +54,7 @@ robot_pose_controller.py
 verify_sync.py
   - Visual validation of camera and trajectory timing
 
-teleoperate.py
+realman_utils.py
   - Tracker-to-robot mapping and safety logic
 
 track.py
@@ -63,7 +63,7 @@ track.py
 QUICK COMMANDS
 --------------
 Record:
-  python combined_simple_teleop_real_logger.py
+  python teleop_recorder.py
 
 Replay:
   python replay_hdf5.py logs/teleop_data_0.hdf5

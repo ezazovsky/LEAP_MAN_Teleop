@@ -1,25 +1,25 @@
 # Bimanual Teleoperation: Execution Guide
 
-This file is execution-only. It lists which scripts you can run from `Combined/` and which parameters each script accepts.
+This file is execution-only. It lists which scripts you can run from `src/` and which parameters each script accepts.
 
 ## Run Location
 
 Run commands from this directory:
 
 ```bash
-cd /home/fri/FRIRobot-1/Combined
+cd /home/fri/FRIRobot-1/src
 ```
 
 ## Runnable Scripts
 
-## 1) `combined_simple_teleop_real_logger.py`
+## 1) `teleop_recorder.py`
 
 Purpose: live teleoperation (arm + hand) with optional camera capture and HDF5 logging.
 
 Basic run:
 
 ```bash
-python combined_simple_teleop_real_logger.py
+python teleop_recorder.py
 ```
 
 Default recording outputs (paired):
@@ -31,7 +31,7 @@ If `--log-path` is provided (for example `--log-path ./logs/run_01.hdf5`), the s
 Example with custom tuning:
 
 ```bash
-python combined_simple_teleop_real_logger.py \
+python teleop_recorder.py \
   --robot-ip 192.168.1.18 \
   --robot-port 8080 \
   --zmq-endpoint tcp://localhost:8000 \
@@ -159,14 +159,14 @@ Parameters:
 
 These files are used as imported modules and are not primary command-line entry scripts in their current form:
 
-- `teleoperate.py`
+- `realman_utils.py`
 - `track.py`
 
 ## Quick Command Reference
 
 ```bash
 # Live teleop + logging
-python combined_simple_teleop_real_logger.py
+python teleop_recorder.py
 
 # Replay recording
 python replay_hdf5.py logs/teleop_data_0.hdf5

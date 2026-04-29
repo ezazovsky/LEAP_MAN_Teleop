@@ -2,4 +2,4 @@
 *.pyc
 .venv/
 __pycache__
-Combined/logs/
+src/logs/

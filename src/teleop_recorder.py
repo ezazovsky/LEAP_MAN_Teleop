@@ -36,7 +36,7 @@ def get_next_numbered_filename(log_dir, prefix, suffix):
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-COMBINED_DIR = os.path.dirname(__file__)
+SRC_DIR = os.path.dirname(__file__)
 REALMAN_DIR = os.path.join(REPO_ROOT, "RMAPI", "Python")
 MANUS_PY_DIR = os.path.join(REPO_ROOT, "LMAPI", "python")
 
@@ -44,13 +44,13 @@ DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
 DEFAULT_CAMERA_FPS = 30
 
-for path in [COMBINED_DIR, REALMAN_DIR, MANUS_PY_DIR]:
+for path in [SRC_DIR, REALMAN_DIR, MANUS_PY_DIR]:
     if path not in sys.path:
         sys.path.insert(0, path)
 
 _teleop_import_error = None
 try:
-    from teleoperate import ViveToRMMapper  # noqa: E402
+    from realman_utils import ViveToRMMapper  # noqa: E402
 except Exception as exc:
     _teleop_import_error = exc
     ViveToRMMapper = None
@@ -521,7 +521,7 @@ class CombinedSimpleTeleop:
         self.glove = ManusErgonomicsSubscriber(endpoint=self.args.zmq_endpoint, hand_side=self.args.hand_side)
 
         # Generate numbered log files
-        log_dir = os.path.join(REPO_ROOT, "Combined", "logs")
+        log_dir = os.path.join(SRC_DIR, "logs")
         if self.args.log_path:
             # If user provided a custom path, use it as-is
             log_path = self.args.log_path
@@ -558,7 +558,7 @@ class CombinedSimpleTeleop:
 
     def run(self):
         self.setup()
-        print(f"\nCombined teleop running at {self.args.control_hz:.1f} Hz. Press Ctrl+C to stop.")
+        print(f"\nsrc teleop running at {self.args.control_hz:.1f} Hz. Press Ctrl+C to stop.")
         dt = 1.0 / self.args.control_hz
 
         while True:
